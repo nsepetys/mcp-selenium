@@ -36,6 +36,29 @@ export class SeleniumServer {
                 // Add additional flags needed for Chrome in containers
                 chromeOptions.addArguments('--disable-dev-shm-usage');
                 chromeOptions.addArguments('--no-sandbox');
+                chromeOptions.addArguments('--disable-gpu');
+                chromeOptions.addArguments('--disable-software-rasterizer');
+                chromeOptions.addArguments('--disable-extensions');
+                chromeOptions.addArguments('--disable-setuid-sandbox');
+                // Prevent Chrome from trying to connect to Google services
+                chromeOptions.addArguments('--disable-background-networking');
+                chromeOptions.addArguments('--disable-default-apps');
+                chromeOptions.addArguments('--disable-sync');
+                chromeOptions.addArguments('--metrics-recording-only');
+                chromeOptions.addArguments('--disable-background-timer-throttling');
+                chromeOptions.addArguments('--disable-backgrounding-occluded-windows');
+                chromeOptions.addArguments('--disable-breakpad');
+                chromeOptions.addArguments('--disable-component-update');
+                chromeOptions.addArguments('--disable-domain-reliability');
+                chromeOptions.addArguments('--disable-features=TranslateUI,BlinkGenPropertyTrees');
+                chromeOptions.addArguments('--disable-hang-monitor');
+                chromeOptions.addArguments('--disable-ipc-flooding-protection');
+                chromeOptions.addArguments('--disable-popup-blocking');
+                chromeOptions.addArguments('--disable-prompt-on-repost');
+                chromeOptions.addArguments('--disable-renderer-backgrounding');
+                chromeOptions.addArguments('--force-color-profile=srgb');
+                chromeOptions.addArguments('--no-first-run');
+                chromeOptions.addArguments('--no-default-browser-check');
 
                 if (options.arguments) {
                     options.arguments.forEach(arg => chromeOptions.addArguments(arg));
@@ -57,10 +80,21 @@ export class SeleniumServer {
                 }
 
                 this._sendProgress('Setting up Chrome driver (this may take a moment on first run)...');
-                driver = await builder
-                    .forBrowser('chrome')
-                    .setChromeOptions(chromeOptions)
-                    .build();
+
+                // Set ChromeDriver path if available
+                if (process.env.CHROMEDRIVER_PATH) {
+                    const chromeService = new chrome.ServiceBuilder(process.env.CHROMEDRIVER_PATH);
+                    driver = await builder
+                        .forBrowser('chrome')
+                        .setChromeOptions(chromeOptions)
+                        .setChromeService(chromeService)
+                        .build();
+                } else {
+                    driver = await builder
+                        .forBrowser('chrome')
+                        .setChromeOptions(chromeOptions)
+                        .build();
+                }
             } else if (browser === 'firefox') {
                 const firefoxOptions = new FirefoxOptions();
                 if (options.headless) {

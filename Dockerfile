@@ -11,12 +11,12 @@ RUN apk update && apk add --no-cache \
     ca-certificates \
     ttf-freefont \
     udev \
-    ttf-opensans \
-    chromium-chromedriver
+    ttf-opensans
 
-# Set Chrome environment variables
+# Set Chrome and ChromeDriver environment variables
 ENV CHROME_BIN=/usr/bin/chromium-browser
 ENV CHROME_PATH=/usr/lib/chromium/
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
 WORKDIR /app
