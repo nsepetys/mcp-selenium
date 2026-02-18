@@ -1,0 +1,43 @@
+# Selenium MCP with VNC support (non-headless)
+# View browser at http://localhost:7900 (noVNC) or VNC client on port 5900
+FROM selenium/standalone-chrome:latest
+
+USER root
+
+# Install Node.js 18
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy application code
+COPY . .
+
+# Environment variables for Chrome
+ENV SE_NODE_MAX_SESSIONS=1
+ENV SE_SESSION_REQUEST_TIMEOUT=300
+ENV DISPLAY=:99
+
+# Expose ports: 3000 (MCP), 7900 (noVNC), 5900 (VNC)
+EXPOSE 3000 7900 5900
+
+# Create startup script that runs both supervisor (for Chrome/VNC) and MCP server
+RUN echo '#!/bin/bash\n\
+/opt/bin/entry_point.sh &\n\
+sleep 3\n\
+node src/lib/server.js\n\
+' > /app/start.sh && chmod +x /app/start.sh
+
+# Switch back to selenium user
+USER seluser
+
+CMD ["/app/start.sh"]

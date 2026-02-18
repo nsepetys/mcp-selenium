@@ -71,6 +71,23 @@ To work on this project:
 2. Install dependencies: `npm install`
 3. Run the server: `npm start`
 
+### Code Structure
+
+```
+src/lib/
+├── server.js          # MAIN - Handles BOTH stdio AND HTTP transport
+│                      # This is what docker-entrypoint.sh runs
+│                      # Contains all Selenium WebDriver logic
+│
+├── selenium-server.js # UNUSED by main server - legacy/alternative implementation
+│                      # Do NOT modify this expecting changes in production
+│
+└── http-server.js     # UNUSED by main server - legacy/alternative implementation
+                       # Do NOT modify this expecting changes in production
+```
+
+**Important:** All browser automation code is in `server.js`. The other files exist but are NOT used by the Docker entrypoint.
+
 ### Installation
 
 #### Installing via Smithery
@@ -439,6 +456,168 @@ None required
 }
 ```
 
+
+---
+
+## Airlocked Agent Integration
+
+This fork includes modifications for running Selenium MCP inside the [airlocked-agent](https://github.com/your-repo/airlocked-agent) containerized environment with proxy security and localhost OAuth support.
+
+### Key Modifications
+
+1. **HTTP Transport Mode**: Runs as an HTTP server (`--http` flag) instead of stdio for container-to-container communication
+2. **Proxy Configuration**: Automatically configures Firefox to use Squid proxy for whitelisted traffic
+3. **Localhost Forwarding**: socat-based forwarding enables OAuth callbacks to `localhost:8000`
+4. **Cross-Session State**: `/state/mcp-state.json` for sharing known issues between Claude sessions
+
+### Running in Airlocked Agent
+
+```yaml
+# docker-compose.airlocked.yml
+selenium-mcp:
+  image: selenium-mcp:latest
+  container_name: airlocked_selenium
+  environment:
+    MCP_TRANSPORT: "http"
+    ENABLE_LOCALHOST_FORWARD: "true"  # For OAuth callbacks
+    HTTP_PROXY: http://proxy:3128
+    HTTPS_PROXY: http://proxy:3128
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  networks:
+    - airlocked_net
+  cap_add:
+    - SYS_CHROOT  # Required for Firefox sandbox
+```
+
+### Browser Support in Airlocked
+
+| Browser | General Browsing | localhost:8000 (OAuth) |
+|---------|-----------------|------------------------|
+| Firefox | ✅ Via proxy | ✅ Via socat |
+| Chrome  | ✅ Via proxy | ❌ Hardcoded bypass |
+
+**Use Firefox for OAuth E2E testing.**
+
+### MCP State File
+
+The server maintains state at `/state/mcp-state.json` for cross-session communication:
+
+```json
+{
+  "knownIssues": [...],
+  "workingPatterns": [...],
+  "notes": [...],
+  "recentErrors": [...]
+}
+```
+
+Query via the `get_mcp_status` tool or `mcp-status://current` resource.
+
+---
+
+## IMPORTANT: Host vs Container - Two Separate Instances
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HOST MACHINE                                         │
+│                                                                              │
+│  ┌──────────────────────────────────┐                                        │
+│  │  Claude Code (host)              │                                        │
+│  │                                  │                                        │
+│  │  Uses: stdio selenium-mcp        │──── Spawns own process ────┐           │
+│  │  Browser: Runs on HOST           │                            │           │
+│  │  localhost:8000: Direct access   │                            ▼           │
+│  └──────────────────────────────────┘                   ┌─────────────────┐  │
+│                                                         │ selenium-mcp    │  │
+│                                                         │ (host process)  │  │
+│                                                         │ Browser: Chrome │  │
+│                                                         │ /Firefox on host│  │
+│  ┌─────────────────────────────────────────────────┐    └─────────────────┘  │
+│  │              Docker Network                      │                        │
+│  │                                                  │                        │
+│  │  ┌─────────────────┐    ┌─────────────────────┐  │                        │
+│  │  │ airlocked_agent │    │ airlocked_selenium  │  │                        │
+│  │  │                 │    │                     │  │                        │
+│  │  │ Uses: HTTP to   │───▶│ Browser: Firefox    │  │                        │
+│  │  │ selenium:3000   │    │ in container        │  │                        │
+│  │  │                 │    │                     │  │                        │
+│  │  └─────────────────┘    │ localhost:8000 ─────┼──┼───▶ socat ──▶ host app │
+│  │                         │ (via socat)         │  │                        │
+│  │                         └─────────────────────┘  │                        │
+│  └─────────────────────────────────────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Points:**
+- **Host Claude Code** spawns its own selenium-mcp process (stdio). Browser runs on host, can access localhost directly.
+- **airlocked_agent** connects to airlocked_selenium container (HTTP). Browser runs in container, needs socat to reach host's localhost.
+- **They do NOT share browsers.** Starting a browser from host Claude Code does not affect airlocked_selenium.
+- **mcp-state.json is shared** (volume mount), which can be confusing - errors from both instances appear there.
+
+---
+
+## Using from Host Machine (Claude Code)
+
+When running Claude Code on your host machine (not inside a container), you have two options:
+
+### Option 1: stdio Transport (Default, Ephemeral)
+
+Uses `docker run --rm` to spawn a fresh container for each session:
+
+```json
+{
+  "mcpServers": {
+    "selenium": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "--shm-size=2g",
+        "selenium-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+**Pros**: Clean environment each time, no persistent state
+**Cons**: Can't access airlocked network, no proxy enforcement
+
+### Option 2: HTTP Transport (Persistent, Shared)
+
+Connect to a running container (e.g., `airlocked_selenium`) via HTTP:
+
+```json
+{
+  "mcpServers": {
+    "selenium": {
+      "url": "http://localhost:3001/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+This requires exposing the port in docker-compose:
+```yaml
+selenium-mcp:
+  ports:
+    - "3001:3000"
+```
+
+**Pros**: Shares state with airlocked agent, proxy enforced, persistent browser sessions
+**Cons**: Requires container to be running, shared state between host and container Claude instances
+
+### Which to Use?
+
+| Use Case | Recommended |
+|----------|-------------|
+| Quick browser automation from host | stdio (Option 1) |
+| E2E testing with airlocked security | HTTP to airlocked_selenium (Option 2) |
+| OAuth flow testing | HTTP with `ENABLE_LOCALHOST_FORWARD=true` |
+| Debugging container selenium issues | HTTP (same instance as agent) |
+
+---
 
 ## License
 
