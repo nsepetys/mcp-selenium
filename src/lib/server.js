@@ -52,8 +52,9 @@ const state = {
     recentErrors: []
 };
 
-// External state file path (mounted volume - central to selenium-mcp)
-const EXTERNAL_STATE_FILE = '/state/mcp-state.json';
+// External state file path (mounted volume at /data)
+const EXTERNAL_STATE_FILE = '/data/mcp-state.json';
+const FEEDBACK_LOG_FILE = '/data/agent-feedback.jsonl';
 
 // Default state (fallback if no external file)
 const DEFAULT_MCP_STATE = {
@@ -263,14 +264,19 @@ server.tool(
                 } catch (e) { /* ignore cleanup errors */ }
             }
 
+            const remoteUrl = process.env.SELENIUM_REMOTE_URL || null;
             let builder = new Builder();
+            if (remoteUrl) {
+                builder = builder.usingServer(remoteUrl);
+                debugLog(`Using remote Selenium Grid: ${remoteUrl}`);
+            }
             let driver;
 
             // Generate unique temp dir for this session
             const sessionTempDir = `/tmp/chrome-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
             // Auto-detect if we need headless mode (no DISPLAY = container/headless environment)
-            const hasDisplay = !!process.env.DISPLAY;
+            const hasDisplay = !!process.env.DISPLAY || !!remoteUrl;
             const forceHeadless = !hasDisplay && options.headless === false;
             const useHeadless = options.headless === true || !hasDisplay;
 
@@ -290,6 +296,13 @@ server.tool(
                     chromeOptions.addArguments('--disable-dev-shm-usage');
                     chromeOptions.addArguments('--no-sandbox');
                     chromeOptions.addArguments('--disable-gpu');
+                    // Memory containment — prevents OOM in long-running container sessions
+                    chromeOptions.addArguments('--renderer-process-limit=2');
+                    chromeOptions.addArguments('--disable-extensions');
+                    chromeOptions.addArguments('--disable-default-apps');
+                    chromeOptions.addArguments('--disk-cache-size=67108864');   // 64MB
+                    chromeOptions.addArguments('--media-cache-size=8388608');   // 8MB
+                    chromeOptions.addArguments('--js-flags=--max-old-space-size=512');
 
                     // Stealth/Anti-detection arguments
                     chromeOptions.addArguments('--disable-blink-features=AutomationControlled');
@@ -339,10 +352,13 @@ server.tool(
                         }
                     }
 
-                    driver = await builder
-                        .forBrowser('chrome')
-                        .setChromeOptions(chromeOptions)
-                        .build();
+                    const buildTimeout = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Chrome browser start timed out after 30s — Selenium Grid may not be ready')), 30000)
+                    );
+                    driver = await Promise.race([
+                        builder.forBrowser('chrome').setChromeOptions(chromeOptions).build(),
+                        buildTimeout
+                    ]);
 
                     // Comprehensive stealth JavaScript (mimics puppeteer-extra-plugin-stealth)
                     // Use CDP to inject BEFORE page scripts execute
@@ -487,15 +503,14 @@ server.tool(
                         Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
                     `;
 
-                    // Inject via CDP for pre-page-load execution
+                    // Inject via CDP for pre-page-load execution (10s timeout — non-fatal if it hangs)
                     try {
-                        await driver.sendDevToolsCommand('Page.addScriptToEvaluateOnNewDocument', {
-                            source: stealthScript
-                        });
+                        await Promise.race([
+                            driver.sendDevToolsCommand('Page.addScriptToEvaluateOnNewDocument', { source: stealthScript }),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('CDP stealth injection timed out')), 10000))
+                        ]);
                     } catch (cdpErr) {
-                        // Fallback to regular executeScript if CDP fails
-                        console.error('CDP injection failed, using fallback:', cdpErr.message);
-                        await driver.executeScript(stealthScript);
+                        console.error('CDP stealth injection failed (skipping):', cdpErr.message);
                     }
                     break;
                 }
@@ -606,6 +621,9 @@ server.tool(
                     throw new Error(`Unsupported browser: ${browser}`);
                 }
             }
+            // Set page load timeout so navigate fails fast instead of hanging (default is 300s)
+            await driver.manage().setTimeouts({ pageLoad: 30000 });
+
             // Use MCP session ID as driver key (HTTP mode) or generate one (STDIO mode)
             const driverKey = mcpSession || `${browser}_${Date.now()}`;
             state.drivers.set(driverKey, driver);
@@ -645,7 +663,10 @@ server.tool(
                 recordError('navigate-localhost-warning', { message: warning });
             }
 
-            await driver.get(url);
+            await Promise.race([
+                driver.get(url),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('navigate timed out after 35s')), 35000))
+            ]);
             return {
                 content: [{ type: 'text', text: `Navigated to ${url}` }]
             };
@@ -1164,6 +1185,7 @@ const BLOCKED_SCRIPT_PATTERNS = [
 // Layer 3: Runtime network sandbox — injected into the page before the user script runs.
 // Uses Object.defineProperty with configurable:false to prevent overrides from being undone.
 const DOCKER_SCRIPT_SANDBOX = `(function() {
+  if (window.__docker_script_sandbox_applied) return;
   var A = ${JSON.stringify(DOCKER_HOST_ALLOWLIST)};
   function ok(u) {
     try { return A.indexOf(new URL(u, location.origin).hostname) !== -1; }
@@ -1173,58 +1195,64 @@ const DOCKER_SCRIPT_SANDBOX = `(function() {
     return function() { throw new Error('Blocked: ' + name + ' is not allowed in docker_script context. This API is sealed by the security sandbox.'); };
   }
   var dp = Object.defineProperty;
+  function seal(obj, prop, val) {
+    try { dp(obj, prop, { value: val, writable: false, configurable: false }); }
+    catch(e) { /* already sealed from a previous call — safe to skip */ }
+  }
 
   // --- Network APIs: only allow Docker host URLs ---
   var _fetch = window.fetch;
-  dp(window, 'fetch', { value: function(input) {
+  seal(window, 'fetch', function(input) {
     var u = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
     if (!ok(u)) throw new Error('Blocked: fetch to external URL (' + u + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
     return _fetch.apply(this, arguments);
-  }, writable: false, configurable: false });
+  });
 
   var _xhrOpen = XMLHttpRequest.prototype.open;
-  dp(XMLHttpRequest.prototype, 'open', { value: function(method, url) {
+  seal(XMLHttpRequest.prototype, 'open', function(method, url) {
     if (!ok(String(url))) throw new Error('Blocked: XHR to external URL (' + url + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
     return _xhrOpen.apply(this, arguments);
-  }, writable: false, configurable: false });
+  });
 
   if (window.WebSocket) {
     var _WS = window.WebSocket;
-    dp(window, 'WebSocket', { value: function(url, protocols) {
+    seal(window, 'WebSocket', function(url, protocols) {
       if (!ok(String(url).replace(/^ws(s?):\\/\\//, 'http$1://'))) throw new Error('Blocked: WebSocket to external URL (' + url + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
       return new _WS(url, protocols);
-    }, writable: false, configurable: false });
+    });
   }
 
   if (window.EventSource) {
     var _ES = window.EventSource;
-    dp(window, 'EventSource', { value: function(url, config) {
+    seal(window, 'EventSource', function(url, config) {
       if (!ok(String(url))) throw new Error('Blocked: EventSource to external URL (' + url + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
       return new _ES(url, config);
-    }, writable: false, configurable: false });
+    });
   }
 
   // --- Block fire-and-forget / exfiltration APIs ---
-  dp(navigator, 'sendBeacon', { value: block('sendBeacon'), writable: false, configurable: false });
-  dp(window, 'open', { value: block('window.open'), writable: false, configurable: false });
+  seal(navigator, 'sendBeacon', block('sendBeacon'));
+  seal(window, 'open', block('window.open'));
 
   // --- Block Workers (separate execution context bypasses all sandbox overrides) ---
-  dp(window, 'Worker', { value: block('Worker'), writable: false, configurable: false });
-  dp(window, 'SharedWorker', { value: block('SharedWorker'), writable: false, configurable: false });
+  seal(window, 'Worker', block('Worker'));
+  seal(window, 'SharedWorker', block('SharedWorker'));
 
   // --- Block iframe/frame/object/embed creation (fresh API references bypass sandbox) ---
   var _createElement = document.createElement.bind(document);
-  dp(document, 'createElement', { value: function(tag) {
+  seal(document, 'createElement', function(tag) {
     var t = String(tag).toLowerCase();
     if (['iframe', 'frame', 'object', 'embed'].indexOf(t) !== -1)
       throw new Error('Blocked: creating <' + t + '> element not allowed in docker_script context. Iframe/frame/object/embed elements are blocked because they provide fresh API references that bypass the sandbox.');
     return _createElement.apply(this, arguments);
-  }, writable: false, configurable: false });
+  });
 
   // --- Block service worker registration ---
   if (navigator.serviceWorker) {
-    dp(navigator.serviceWorker, 'register', { value: block('ServiceWorker.register'), writable: false, configurable: false });
+    seal(navigator.serviceWorker, 'register', block('ServiceWorker.register'));
   }
+
+  window.__docker_script_sandbox_applied = true;
 })();
 `;
 
@@ -1383,13 +1411,15 @@ server.tool(
     "take_screenshot",
     "captures a screenshot of the current page and saves to /data/screenshots directory",
     {
-        outputPath: z.string().optional().describe("Filename for the screenshot (e.g. 'screenshot.png'). Use ONLY a simple filename, NOT a full path. Files are saved to /data/screenshots. If not provided, returns image data directly.")
+        outputPath: z.string().optional().describe("Filename for the screenshot (e.g. 'screenshot.png'). Use ONLY a simple filename, NOT a full path. Files are saved to /data/screenshots. If not provided, returns compressed image data directly."),
+        quality: z.number().min(0.1).max(1.0).optional().describe("JPEG compression quality for inline screenshots (0.1-1.0, default 0.7). Lower = smaller file size. Ignored when saving to file."),
+        maxWidth: z.number().min(100).max(3840).optional().describe("Maximum width in pixels for inline screenshots (default 1280). Image is scaled down if wider. Ignored when saving to file.")
     },
-    async ({ outputPath }) => {
+    async ({ outputPath, quality = 0.7, maxWidth = 1280 }) => {
         try {
             const driver = getDriver();
-            const screenshot = await driver.takeScreenshot();
             if (outputPath) {
+                const screenshot = await driver.takeScreenshot();
                 const fs = await import('fs');
                 const path = await import('path');
                 // Extract just the filename if a full path was provided (handles Windows paths too)
@@ -1424,9 +1454,34 @@ server.tool(
                     };
                 }
             } else {
+                // Inline screenshot: use CDP to capture JPEG directly (avoids MCP 20MB limit).
+                // CDP captures in the browser process — no large PNG transfer needed.
+                let imageData;
+                let mimeType;
+                try {
+                    const cdpTimeout = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('CDP screenshot timed out after 10s')), 10000)
+                    );
+                    const cdpResult = await Promise.race([
+                        driver.sendAndGetDevToolsCommand('Page.captureScreenshot', {
+                            format: 'jpeg',
+                            quality: Math.round(quality * 100),
+                            captureBeyondViewport: false
+                        }),
+                        cdpTimeout
+                    ]);
+                    imageData = cdpResult.data;
+                    mimeType = 'image/jpeg';
+                    debugLog(`CDP screenshot: JPEG quality=${Math.round(quality * 100)}, size=${imageData.length} chars`);
+                } catch (cdpErr) {
+                    // CDP not available (Firefox or non-Chrome) or timed out, fall back to raw PNG
+                    debugLog(`CDP screenshot failed: ${cdpErr.message}, returning raw PNG`);
+                    imageData = await driver.takeScreenshot();
+                    mimeType = 'image/png';
+                }
                 return {
                     content: [
-                        { type: 'image', data: screenshot, mimeType: 'image/png' }
+                        { type: 'image', data: imageData, mimeType }
                     ]
                 };
             }
@@ -1504,6 +1559,14 @@ server.tool(
                 }
             }
 
+            if (status.agentFeedback && status.agentFeedback.length > 0) {
+                text += `\n### Agent Feedback (last ${Math.min(5, status.agentFeedback.length)})\n`;
+                for (const fb of status.agentFeedback.slice(0, 5)) {
+                    text += `- [${fb.type.toUpperCase()}${fb.browser && fb.browser !== 'all' ? `/${fb.browser}` : ''}] ${fb.message}\n`;
+                }
+                text += `  _(full history: /data/agent-feedback.jsonl)_\n`;
+            }
+
             if (status.recentErrors && status.recentErrors.length > 0) {
                 text += `\n### Recent Errors\n`;
                 for (const err of status.recentErrors.slice(0, 5)) {
@@ -1538,6 +1601,13 @@ server.tool(
             // Only clear currentSession in STDIO mode
             if (!getMcpSessionId()) {
                 state.currentSession = null;
+                // Kill orphaned Chrome processes to prevent memory accumulation
+                try {
+                    const { execSync } = await import('child_process');
+                    execSync('pkill -9 chromium || true', { stdio: 'ignore' });
+                    execSync('pkill -9 chrome || true', { stdio: 'ignore' });
+                    execSync('rm -rf /tmp/chrome-* /tmp/.org.chromium.* || true', { stdio: 'ignore' });
+                } catch (e) { /* ignore */ }
             }
             debugLog(`Browser session closed: key=${key}, remaining=${state.drivers.size}`);
             return {
@@ -1551,56 +1621,97 @@ server.tool(
     }
 );
 
-// Resources
-server.resource(
-    "browser-status",
-    new ResourceTemplate("browser-status://current"),
-    async (uri) => ({
-        contents: [{
-            uri: uri.href,
-            text: state.currentSession
-                ? `Active browser session: ${state.currentSession}`
-                : "No active browser session"
-        }]
-    })
-);
+server.tool(
+    "log_feedback",
+    "Log agent observations, bugs, or working patterns so other agents can learn from them via get_mcp_status. Use this to share discoveries about what works or doesn't work with Selenium MCP.",
+    {
+        type: z.enum(['issue', 'pattern', 'note', 'resolve']).describe(
+            "Type: 'issue' = bug/problem encountered, 'pattern' = working approach discovered, 'note' = general observation, 'resolve' = mark an existing issue as fixed"
+        ),
+        message: z.string().describe(
+            "The feedback. For 'issue': describe the problem and workaround if known. For 'pattern': describe the working approach. For 'note': general observation. For 'resolve': describe what fixed it."
+        ),
+        severity: z.enum(['low', 'medium', 'high', 'blocker']).optional().describe(
+            "Severity for 'issue' type only. Default: medium"
+        ),
+        issueId: z.string().optional().describe(
+            "For 'resolve' type: the ID of the issue to deactivate (see get_mcp_status for IDs)"
+        ),
+        browser: z.string().optional().describe(
+            "Browser this applies to: chrome, firefox, edge, or 'all'. Default: all"
+        )
+    },
+    async ({ type, message, severity = 'medium', issueId, browser = 'all' }) => {
+        try {
+            const timestamp = new Date().toISOString();
+            const entry = { timestamp, type, message, browser, severity: type === 'issue' ? severity : undefined };
 
-// Comprehensive MCP status resource for cross-session communication
-server.resource(
-    "mcp-status",
-    new ResourceTemplate("mcp-status://current"),
-    async (uri) => {
-        // Read external state file
-        const externalState = readExternalState();
-
-        // Update browser health dynamically
-        const browserHealth = {};
-        for (const [sessionId, driver] of state.drivers) {
+            // Append to raw JSONL log (full history, never trimmed)
             try {
-                // Try a simple operation to check if browser is responsive
-                await driver.getTitle();
-                browserHealth[sessionId] = { status: 'healthy', lastCheck: new Date().toISOString() };
+                fs.mkdirSync('/data', { recursive: true });
+                fs.appendFileSync(FEEDBACK_LOG_FILE, JSON.stringify(entry) + '\n');
             } catch (e) {
-                browserHealth[sessionId] = { status: 'unhealthy', error: e.message, lastCheck: new Date().toISOString() };
+                debugLog(`Failed to append to feedback log: ${e.message}`);
             }
-        }
 
-        return {
-            contents: [{
-                uri: uri.href,
-                mimeType: "application/json",
-                text: JSON.stringify({
-                    ...externalState,
-                    browserHealth,
-                    recentErrors: externalState.recentErrors || state.recentErrors,
-                    activeSessions: Array.from(state.drivers.keys()),
-                    currentSession: state.currentSession,
-                    serverUptime: process.uptime()
-                }, null, 2)
-            }]
-        };
+            // Update structured state
+            const externalState = readExternalState();
+            externalState.agentFeedback = externalState.agentFeedback || [];
+            externalState.agentFeedback.unshift(entry);
+            if (externalState.agentFeedback.length > 50) {
+                externalState.agentFeedback.pop();
+            }
+
+            if (type === 'issue') {
+                const id = `agent-${Date.now()}`;
+                externalState.knownIssues = externalState.knownIssues || [];
+                externalState.knownIssues.unshift({
+                    id,
+                    browser,
+                    severity,
+                    description: message,
+                    workaround: 'See agent-feedback.jsonl for context',
+                    active: true,
+                    reportedAt: timestamp
+                });
+            } else if (type === 'resolve' && issueId) {
+                const issue = (externalState.knownIssues || []).find(i => i.id === issueId);
+                if (issue) {
+                    issue.active = false;
+                    issue.resolvedAt = timestamp;
+                    issue.resolution = message;
+                }
+            } else if (type === 'pattern') {
+                externalState.workingPatterns = externalState.workingPatterns || [];
+                externalState.workingPatterns.unshift({
+                    pattern: `agent-${Date.now()}`,
+                    description: message,
+                    recommended: browser !== 'all' ? `(${browser} only)` : '(all browsers)',
+                    avoid: [],
+                    reportedAt: timestamp
+                });
+            } else if (type === 'note') {
+                externalState.notes = externalState.notes || [];
+                externalState.notes.unshift(`[${timestamp}] ${message}`);
+                if (externalState.notes.length > 20) externalState.notes.pop();
+            }
+
+            writeExternalState(externalState);
+            return {
+                content: [{ type: 'text', text: `Feedback logged (${type}): "${message.slice(0, 80)}${message.length > 80 ? '…' : ''}"` }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error logging feedback: ${e.message}` }]
+            };
+        }
     }
 );
+
+// Resources removed — ResourceTemplate registration causes resources/list to throw
+// "Cannot read properties of undefined (reading 'list')" in MCP SDK 1.20.x.
+// Use the get_mcp_status tool instead, which exposes the same information.
+void ResourceTemplate; // keep import reference live to avoid lint warnings
 
 // Cleanup handler
 async function cleanup() {

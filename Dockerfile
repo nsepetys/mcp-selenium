@@ -43,7 +43,7 @@ RUN ./node_modules/selenium-webdriver/bin/linux/selenium-manager --browser firef
 COPY . .
 
 # Make entrypoint script executable
-RUN chmod +x docker-entrypoint.sh
+RUN sed -i 's/\r$//' docker-entrypoint.sh && chmod +x docker-entrypoint.sh
 
 # Expose port for HTTP/SSE mode
 EXPOSE 3000
