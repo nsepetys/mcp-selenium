@@ -1461,9 +1461,9 @@ server.tool(
 
 server.tool(
     "take_screenshot",
-    "captures a screenshot of the current page and saves to /data/screenshots directory",
+    "captures a screenshot of the current page and saves to a per-session subdirectory of /data/screenshots",
     {
-        outputPath: z.string().optional().describe("Filename for the screenshot (e.g. 'screenshot.png'). Use ONLY a simple filename, NOT a full path. Files are saved to /data/screenshots. If not provided, returns compressed image data directly."),
+        outputPath: z.string().optional().describe("Filename for the screenshot (e.g. 'screenshot.png'). Use ONLY a simple filename, NOT a full path. Files are saved under a per-session subdirectory of /data/screenshots so concurrent agents don't overwrite each other. If not provided, returns compressed image data directly."),
         quality: z.number().min(0.1).max(1.0).optional().describe("JPEG compression quality for inline screenshots (0.1-1.0, default 0.7). Lower = smaller file size. Ignored when saving to file."),
         maxWidth: z.number().min(100).max(3840).optional().describe("Maximum width in pixels for inline screenshots (default 1280). Image is scaled down if wider. Ignored when saving to file.")
     },
@@ -1480,8 +1480,11 @@ server.tool(
                 if (filename.includes(':') || filename.includes('\\') || filename.includes('/')) {
                     filename = filename.split(/[:\\/]/).pop();
                 }
-                // Ensure screenshots directory exists and save there
-                const screenshotDir = '/data/screenshots';
+                // Per-session subdirectory so concurrent agents sharing the /data
+                // volume don't overwrite each other's identically-named screenshots.
+                const sessionKey = getDriverKey();
+                const sessionSubdir = String(sessionKey || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
+                const screenshotDir = `/data/screenshots/${sessionSubdir}`;
                 try {
                     await fs.promises.mkdir(screenshotDir, { recursive: true });
                 } catch (e) { /* ignore if exists */ }
@@ -1490,7 +1493,7 @@ server.tool(
                     await fs.promises.writeFile(finalPath, screenshot, 'base64');
                     // Report host path if available
                     const hostPath = process.env.HOST_DATA_PATH
-                        ? `${process.env.HOST_DATA_PATH}/screenshots/${filename}`
+                        ? `${process.env.HOST_DATA_PATH}/screenshots/${sessionSubdir}/${filename}`
                         : finalPath;
                     return {
                         content: [{ type: 'text', text: `Screenshot saved to ${hostPath}` }]
