@@ -2,6 +2,11 @@
 # View browser at http://localhost:7900 (noVNC) or VNC client on port 5900
 FROM selenium/standalone-chrome:latest
 
+# Build identifier — pass with --build-arg BUILD_ID=<tag> so a running container can
+# be matched back to the image that produced it (see /health and get_mcp_status).
+ARG BUILD_ID=dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
 USER root
 
 # Install Node.js 18
@@ -35,14 +40,10 @@ EXPOSE 3000 7900 5900
 # Create startup script that runs both supervisor (for Chrome/VNC) and MCP server
 RUN printf '#!/bin/bash\n\
 /opt/bin/entry_point.sh &\n\
-# Wait for Xvfb display to be ready\n\
+# Wait for Xvfb display to be ready before starting the MCP server.\n\
+# We do NOT wait for Selenium Grid — the MCP server uses ChromeDriver directly.\n\
 for i in $(seq 1 30); do\n\
   if xdpyinfo -display :99 > /dev/null 2>&1; then break; fi\n\
-  sleep 1\n\
-done\n\
-# Wait for Selenium Grid to be ready (Java process takes longer than the display)\n\
-for i in $(seq 1 60); do\n\
-  if curl -sf http://localhost:4444/status > /dev/null 2>&1; then break; fi\n\
   sleep 1\n\
 done\n\
 exec node src/lib/server.js\n\

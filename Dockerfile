@@ -1,5 +1,10 @@
 FROM node:18-slim
 
+# Build identifier — pass with --build-arg BUILD_ID=<tag> so a running container can
+# be matched back to the image that produced it (see /health and get_mcp_status).
+ARG BUILD_ID=dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
 # Install Chrome, Firefox, dependencies, and tini for proper zombie process handling
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \

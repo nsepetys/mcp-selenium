@@ -21,6 +21,17 @@ import { AsyncLocalStorage } from 'async_hooks';
 // to isolate browser sessions so multiple agents can run concurrently.
 const mcpSessionContext = new AsyncLocalStorage();
 
+// Build identifier — stamped at image build time via --build-arg BUILD_ID, surfaced
+// in /health and get_mcp_status so a running container can be matched to its image.
+const BUILD_ID = process.env.SELENIUM_MCP_BUILD_ID || 'dev';
+
+// Cross-session diagnostic counters, exposed via /health and get_mcp_status.
+const metrics = {
+    transportErrors: 0,
+    protocolErrors: 0,
+    misrouteGuardTrips: 0
+};
+
 // Debug logging to file (console.error doesn't appear in docker logs for some reason)
 const DEBUG_LOG = '/tmp/selenium-debug.log';
 function debugLog(msg) {
@@ -37,19 +48,15 @@ function debugLog(msg) {
 fs.writeFileSync('/tmp/server-startup.txt', `Server module loaded at ${new Date().toISOString()}\n`);
 debugLog('Server module loaded');
 
-// Create an MCP server
-const server = new McpServer({
-    name: "MCP Selenium",
-    version: "1.0.0"
-});
-
 // Server state
 const state = {
     drivers: new Map(),
     currentSession: null,
     // Dynamic state (populated at runtime)
     browserHealth: {},
-    recentErrors: []
+    recentErrors: [],
+    // Per-driver health tracking: driverKey → { healthy, failCount, checkedAt, error }
+    driverHealth: new Map()
 };
 
 // External state file path (mounted volume at /data)
@@ -113,6 +120,23 @@ function writeExternalState(newState) {
     }
 }
 
+// Chrome crash error signatures — these mean the browser process/tab is dead,
+// not just a transient network or selector error.
+const CHROME_CRASH_PATTERNS = /tab crashed|no such session|session deleted|chrome not reachable|no such window|target window already closed|session not created|cannot determine loading status/i;
+
+// Tracks when each driver last ran a successful tool call (used by idle health check)
+const lastToolSuccessAt = new Map();
+
+// Mark a driver session as healthy after a successful tool call
+function recordSuccess(key) {
+    if (!key) return;
+    lastToolSuccessAt.set(key, Date.now());
+    const h = state.driverHealth.get(key);
+    if (h && !h.healthy) {
+        state.driverHealth.set(key, { healthy: true, failCount: 0, checkedAt: Date.now() });
+    }
+}
+
 // Helper to record errors for cross-session visibility
 function recordError(context, error) {
     const errorEntry = {
@@ -139,6 +163,18 @@ function recordError(context, error) {
         writeExternalState(externalState);
     } catch (e) {
         debugLog(`Failed to persist error to external state: ${e.message}`);
+    }
+
+    // Reactive Chrome crash detection — update driverHealth immediately when a
+    // tool call returns a crash-signature error. No polling needed; no false positives.
+    if (CHROME_CRASH_PATTERNS.test(errorEntry.message)) {
+        const key = getMcpSessionId() || state.currentSession;
+        if (key && state.drivers.has(key)) {
+            const prev = state.driverHealth.get(key) || { failCount: 0 };
+            const failCount = prev.failCount + 1;
+            state.driverHealth.set(key, { healthy: false, failCount, checkedAt: Date.now(), error: errorEntry.message });
+            console.error(`Chrome crash detected for session ${key} (fail #${failCount}): ${errorEntry.message}`);
+        }
     }
 }
 
@@ -218,6 +254,17 @@ const locatorSchema = {
     pierce_shadow: z.boolean().optional().describe("If true, searches through Shadow DOM boundaries. Only works with CSS selectors.")
 };
 
+// Creates a brand-new McpServer with every tool registered on it. Called once per
+// HTTP session (see the /mcp route) and once for the single STDIO session, so that
+// no two sessions ever share a server whose Protocol.connect() would silently
+// overwrite the other's transport (see node_modules/@modelcontextprotocol/sdk
+// dist/esm/shared/protocol.js — connect() replaces this._transport wholesale).
+function createMcpServer() {
+    const server = new McpServer({
+        name: "MCP Selenium",
+        version: "1.0.0"
+    });
+
 // Browser Management Tools
 server.tool(
     "start_browser",
@@ -287,6 +334,10 @@ server.tool(
             switch (browser) {
                 case 'chrome': {
                     const chromeOptions = new ChromeOptions();
+                    // Support base image (Chromium) and VNC image (Google Chrome)
+                    if (process.env.CHROME_BIN) {
+                        chromeOptions.setChromeBinaryPath(process.env.CHROME_BIN);
+                    }
                     if (useHeadless) {
                         chromeOptions.addArguments('--headless=new');
                     }
@@ -302,7 +353,7 @@ server.tool(
                     chromeOptions.addArguments('--disable-default-apps');
                     chromeOptions.addArguments('--disk-cache-size=67108864');   // 64MB
                     chromeOptions.addArguments('--media-cache-size=8388608');   // 8MB
-                    chromeOptions.addArguments('--js-flags=--max-old-space-size=512');
+                    chromeOptions.addArguments('--js-flags=--max-old-space-size=1024');
 
                     // Stealth/Anti-detection arguments
                     chromeOptions.addArguments('--disable-blink-features=AutomationControlled');
@@ -667,6 +718,7 @@ server.tool(
                 driver.get(url),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('navigate timed out after 35s')), 35000))
             ]);
+            recordSuccess(getDriverKey());
             return {
                 content: [{ type: 'text', text: `Navigated to ${url}` }]
             };
@@ -1479,6 +1531,7 @@ server.tool(
                     imageData = await driver.takeScreenshot();
                     mimeType = 'image/png';
                 }
+                recordSuccess(getDriverKey());
                 return {
                     content: [
                         { type: 'image', data: imageData, mimeType }
@@ -1518,6 +1571,7 @@ server.tool(
             // Merge external state with runtime state
             const status = {
                 ...externalState,
+                buildId: BUILD_ID,
                 browserHealth,
                 recentErrors: externalState.recentErrors || state.recentErrors,
                 activeSessions: Array.from(state.drivers.keys()),
@@ -1527,6 +1581,7 @@ server.tool(
 
             // Format as readable text for agents
             let text = `## MCP Selenium Status\n\n`;
+            text += `**Build:** ${BUILD_ID}\n`;
             text += `**Server Uptime:** ${Math.round(status.serverUptime)}s\n`;
             text += `**Active Sessions:** ${status.activeSessions.length ? status.activeSessions.join(', ') : 'None'}\n`;
             if (status.lastErrorUpdate) {
@@ -1598,6 +1653,8 @@ server.tool(
             }
             await driver.quit();
             state.drivers.delete(key);
+            state.driverHealth.delete(key);
+            lastToolSuccessAt.delete(key);
             // Only clear currentSession in STDIO mode
             if (!getMcpSessionId()) {
                 state.currentSession = null;
@@ -1708,6 +1765,9 @@ server.tool(
     }
 );
 
+    return server;
+}
+
 // Resources removed — ResourceTemplate registration causes resources/list to throw
 // "Cannot read properties of undefined (reading 'list')" in MCP SDK 1.20.x.
 // Use the get_mcp_status tool instead, which exposes the same information.
@@ -1739,16 +1799,25 @@ const port = parseInt(process.env.MCP_PORT || '3000', 10);
 
 // Start the server based on transport mode
 if (transportMode === 'stdio') {
-    // Standard stdio transport (default)
+    // Standard stdio transport (default) — one process, one session, so a single
+    // McpServer instance for the process lifetime is correct here.
+    console.error(`Selenium MCP starting: build=${BUILD_ID} transport=${transportMode}`);
+    const stdioServer = createMcpServer();
     const transport = new StdioServerTransport();
-    await server.connect(transport);
+    await stdioServer.connect(transport);
 } else if (transportMode === 'http') {
+    console.log(`Selenium MCP starting: build=${BUILD_ID} transport=${transportMode}`);
     // Streamable HTTP transport (recommended for remote MCP servers)
     const app = express();
     app.use(cors());
 
-    // Store transports by session ID
-    const transports = new Map();
+    // Store one { server, transport, createdAt, lastSeenAt } entry per MCP session.
+    // Each session gets its OWN McpServer instance — the SDK's Protocol.connect()
+    // (node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js) overwrites
+    // a single shared this._transport, so sharing one McpServer across sessions
+    // caused cross-session response contamination and hangs. One server per session
+    // avoids that entirely.
+    const sessions = new Map();
 
     // Single MCP endpoint for all operations (Streamable HTTP)
     // NOTE: Do NOT use express.json() middleware before this route -
@@ -1758,19 +1827,69 @@ if (transportMode === 'stdio') {
         const sessionId = req.headers['mcp-session-id'] || randomUUID();
         debugLog(`Session ID: ${sessionId}`);
 
-        let transport = transports.get(sessionId);
+        let session = sessions.get(sessionId);
 
-        if (!transport) {
-            // Create new transport for this session
-            transport = new StreamableHTTPServerTransport({
+        if (!session) {
+            // Create a brand-new McpServer + transport dedicated to this session.
+            const sessionServer = createMcpServer();
+            const transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => sessionId,
             });
-            transports.set(sessionId, transport);
 
-            // Connect the MCP server to this transport
-            await server.connect(transport);
+            // Loud failure paths. These MUST be assigned before sessionServer.connect()
+            // below: Protocol.connect() captures whatever onerror/onclose already sit on
+            // the transport and wraps them (calls ours, then its own internal handler),
+            // so setting them after connect() would silently replace — not augment —
+            // the SDK's own cleanup logic.
+            transport.onerror = (err) => {
+                metrics.transportErrors++;
+                console.error(`[TRANSPORT-ERROR] session=${sessionId}: ${err.message}`);
+            };
+            transport.onclose = () => {
+                console.error(`[SESSION-CLOSED] session=${sessionId}`);
+                sessions.delete(sessionId);
+                const driver = state.drivers.get(sessionId);
+                if (driver) {
+                    driver.quit().catch((e) => console.error(`Error quitting driver for closed session ${sessionId}: ${e.message}`));
+                    state.drivers.delete(sessionId);
+                }
+                state.driverHealth.delete(sessionId);
+                lastToolSuccessAt.delete(sessionId);
+                if (state.currentSession === sessionId) state.currentSession = null;
+            };
 
-            console.log(`New MCP session: ${sessionId}`);
+            // Protocol-level errors (distinct from the transport-level errors above —
+            // e.g. failure to send a response, or an unknown message type).
+            sessionServer.server.onerror = (err) => {
+                metrics.protocolErrors++;
+                console.error(`[PROTOCOL-ERROR] session=${sessionId}: ${err.message}`);
+            };
+
+            session = { server: sessionServer, transport, createdAt: Date.now(), lastSeenAt: Date.now() };
+            sessions.set(sessionId, session);
+
+            // Explicitly echo session ID in response header so a load balancer
+            // (e.g. HAProxy stick-table) can establish session affinity on first request
+            res.setHeader('Mcp-Session-Id', sessionId);
+
+            // Connect this session's own MCP server to its own transport
+            await sessionServer.connect(transport);
+
+            console.log(`New MCP session: ${sessionId} (build=${BUILD_ID})`);
+        } else {
+            session.lastSeenAt = Date.now();
+        }
+
+        const { transport } = session;
+
+        // Misroute guard: under the old shared-server design, one session's transport
+        // could silently receive another session's responses. Each session now owns
+        // its own McpServer so this should never trip — kept as a loud regression
+        // guard rather than a silent hang.
+        if (transport.sessionId !== undefined && transport.sessionId !== sessionId) {
+            metrics.misrouteGuardTrips++;
+            console.error(`[MISROUTE-GUARD] map key=${sessionId} but transport.sessionId=${transport.sessionId}`);
+            return res.status(500).json({ error: 'Session misroute detected', expectedSessionId: sessionId, transportSessionId: transport.sessionId });
         }
 
         // Handle the request within session context so tool handlers
@@ -1790,9 +1909,76 @@ if (transportMode === 'stdio') {
     // JSON parsing for non-MCP routes
     app.use(express.json());
 
-    // Health check endpoint
+    // Background Chrome health checker — ONLY runs on idle sessions (no successful
+    // tool call in the last 15s). This avoids false positives from executeScript
+    // queuing behind an active navigate and timing out while Chrome is healthy.
+    // Primary crash detection is reactive (via recordError pattern matching).
+    // This background check catches the case where Chrome dies between tool calls.
+    async function runIdleDriverHealthChecks() {
+        const now = Date.now();
+        for (const [key, driver] of state.drivers) {
+            const lastSuccess = lastToolSuccessAt.get(key) || 0;
+            if (now - lastSuccess < 15000) continue; // skip — session is active
+            try {
+                await Promise.race([
+                    driver.executeScript('return 1'),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+                ]);
+                // Successful idle check — clear any prior unhealthy state
+                const h = state.driverHealth.get(key);
+                if (h && !h.healthy) {
+                    state.driverHealth.set(key, { healthy: true, failCount: 0, checkedAt: now });
+                    console.log(`Driver health recovered for ${key}`);
+                }
+                lastToolSuccessAt.set(key, now);
+            } catch (e) {
+                const prev = state.driverHealth.get(key) || { failCount: 0 };
+                const failCount = prev.failCount + 1;
+                state.driverHealth.set(key, { healthy: false, failCount, checkedAt: now, error: e.message });
+                console.error(`Idle health check failed for ${key} (fail #${failCount}): ${e.message}`);
+                // After 2 consecutive failures the session is unrecoverable — clean it up so
+                // /health can return 200 again and the container re-enters HAProxy rotation.
+                if (failCount >= 2) {
+                    console.error(`Auto-cleanup: removing unrecoverable session ${key}`);
+                    try { await driver.quit(); } catch {}
+                    state.drivers.delete(key);
+                    state.driverHealth.delete(key);
+                    lastToolSuccessAt.delete(key);
+                    if (state.currentSession === key) state.currentSession = null;
+                }
+            }
+        }
+        // Remove stale health entries for drivers that no longer exist
+        for (const key of state.driverHealth.keys()) {
+            if (!state.drivers.has(key)) state.driverHealth.delete(key);
+        }
+    }
+    setInterval(runIdleDriverHealthChecks, 15000);
+
+    // Health check endpoint — returns 503 if any active Chrome session has crashed
+    // (2+ consecutive health check failures). HAProxy marks this backend DOWN on 503,
+    // pulling it out of rotation until Chrome recovers or the session is closed.
     app.get('/health', (req, res) => {
-        res.json({ status: 'ok', transport: 'streamable-http', sessions: transports.size });
+        const sessionCount = sessions.size;
+        const browserCount = state.drivers.size;
+        const crashed = [];
+        for (const [key, h] of state.driverHealth) {
+            if (!h.healthy && h.failCount >= 2 && state.drivers.has(key)) {
+                crashed.push({ session: key, failCount: h.failCount, error: h.error });
+            }
+        }
+        const base = {
+            status: crashed.length > 0 ? 'degraded' : 'ok',
+            transport: 'streamable-http',
+            buildId: BUILD_ID,
+            sessions: sessionCount,
+            browsers: browserCount,
+            metrics: { ...metrics }
+        };
+        if (crashed.length > 0) {
+            return res.status(503).json({ ...base, crashed });
+        }
+        res.json(base);
     });
 
     app.listen(port, '0.0.0.0', () => {
