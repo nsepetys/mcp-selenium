@@ -44,7 +44,7 @@ services:
       DOCKER_VOLUME: selenium-mcp_selenium-data
       WORKER_IMAGE: selenium-mcp
       MIN_WORKERS: "2"
-      MAX_WORKERS: "10"
+      MAX_WORKERS: "14"
       WORKER_MEMORY: "2g"            # memory cap for dynamic workers (2g handles heavy sites like Airbnb)
       SCALE_DOWN_IDLE_MS: "120000"   # 2 min idle before removing a dynamic worker
       POLL_INTERVAL_MS: "30000"      # check every 30s
