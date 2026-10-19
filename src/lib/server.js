@@ -14,6 +14,7 @@ import { Options as FirefoxOptions } from 'selenium-webdriver/firefox.js';
 import { Options as EdgeOptions } from 'selenium-webdriver/edge.js';
 import fs from 'fs';
 import os from 'os';
+import { execFileSync } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 
 // AsyncLocalStorage for threading MCP session ID to tool handlers
@@ -29,8 +30,20 @@ const BUILD_ID = process.env.SELENIUM_MCP_BUILD_ID || 'dev';
 const metrics = {
     transportErrors: 0,
     protocolErrors: 0,
-    misrouteGuardTrips: 0
+    misrouteGuardTrips: 0,
+    reapedSessions: 0,       // idle/hung sessions evicted by the session reaper
+    resurrectedSessions: 0,  // unknown session ids served on a fresh pre-initialized session
+    forcedQuits: 0           // driver.quit() timed out and the browser was killed instead
 };
+
+// Container identity (Docker sets the hostname to the short container id), surfaced in
+// /health and get_mcp_status so a wedged instance can be found and restarted directly.
+const CONTAINER_ID = os.hostname();
+
+// driver.quit() against a wedged Chrome never returns. Every quit goes through
+// forceQuitDriver(), which races quit against this timeout and kills the browser's
+// processes if it loses, so no tool call or cleanup can hang behind a dead browser.
+const DRIVER_QUIT_TIMEOUT_MS = parseInt(process.env.DRIVER_QUIT_TIMEOUT_MS || '10000', 10);
 
 // Debug logging to file (console.error doesn't appear in docker logs for some reason)
 const DEBUG_LOG = '/tmp/selenium-debug.log';
@@ -56,8 +69,48 @@ const state = {
     browserHealth: {},
     recentErrors: [],
     // Per-driver health tracking: driverKey → { healthy, failCount, checkedAt, error }
-    driverHealth: new Map()
+    driverHealth: new Map(),
+    // Per-driver metadata: driverKey → { userDataDir } — lets forceQuitDriver kill
+    // exactly this session's browser processes, never another session's.
+    driverMeta: new Map()
 };
+
+// Release a session's browser without ever hanging on it.
+// State is released FIRST, so even if Chrome is wedged the session is immediately
+// free (a following start_browser/close_session cannot block on the dead browser).
+// Then quit is raced against DRIVER_QUIT_TIMEOUT_MS; on timeout the browser is killed
+// by its unique --user-data-dir, which only this session's Chrome processes carry.
+async function forceQuitDriver(key, reason) {
+    const driver = state.drivers.get(key);
+    const meta = state.driverMeta.get(key);
+    state.drivers.delete(key);
+    state.driverHealth.delete(key);
+    state.driverMeta.delete(key);
+    lastToolSuccessAt.delete(key);
+    if (state.currentSession === key) state.currentSession = null;
+    if (!driver) return 'none';
+    let timer;
+    try {
+        await Promise.race([
+            driver.quit(),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`quit timed out after ${DRIVER_QUIT_TIMEOUT_MS}ms`)), DRIVER_QUIT_TIMEOUT_MS);
+            })
+        ]);
+        return 'quit';
+    } catch (e) {
+        metrics.forcedQuits++;
+        console.error(`[FORCE-QUIT] key=${key} reason=${reason}: ${e.message}`);
+        if (meta?.userDataDir) {
+            try {
+                execFileSync('pkill', ['-9', '-f', '--', meta.userDataDir], { stdio: 'ignore' });
+            } catch { /* pkill exits 1 when nothing matched — fine */ }
+        }
+        return 'killed';
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 // External state file path (mounted volume at /data)
 const EXTERNAL_STATE_FILE = '/data/mcp-state.json';
@@ -286,20 +339,13 @@ server.tool(
 
             if (mcpSession) {
                 // HTTP mode: only clean up THIS session's browser
-                const existingDriver = state.drivers.get(mcpSession);
-                if (existingDriver) {
+                if (state.drivers.has(mcpSession)) {
                     debugLog(`Cleaning up existing browser for MCP session ${mcpSession}`);
-                    try { await existingDriver.quit(); } catch (e) { /* ignore */ }
-                    state.drivers.delete(mcpSession);
+                    await forceQuitDriver(mcpSession, 'start_browser-replace');
                 }
             } else {
                 // STDIO mode: clean up all sessions (only one expected)
-                for (const [sessionId, existingDriver] of state.drivers) {
-                    try {
-                        await existingDriver.quit();
-                    } catch (e) { /* ignore */ }
-                }
-                state.drivers.clear();
+                await Promise.all([...state.drivers.keys()].map((k) => forceQuitDriver(k, 'start_browser-replace')));
                 state.currentSession = null;
 
                 // Kill any orphaned browser processes (only safe in single-session mode)
@@ -346,7 +392,6 @@ server.tool(
                     // Container-friendly Chrome arguments
                     chromeOptions.addArguments('--disable-dev-shm-usage');
                     chromeOptions.addArguments('--no-sandbox');
-                    chromeOptions.addArguments('--disable-gpu');
                     // Memory containment — prevents OOM in long-running container sessions
                     chromeOptions.addArguments('--renderer-process-limit=2');
                     chromeOptions.addArguments('--disable-extensions');
@@ -360,7 +405,26 @@ server.tool(
                     chromeOptions.addArguments('--disable-infobars');
                     chromeOptions.addArguments('--window-size=1920,1080');
                     chromeOptions.addArguments('--start-maximized');
-                    chromeOptions.addArguments('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+
+                    // Headed host-mimicking mode: a real X display is present (Xvfb),
+                    // so match the host's devicePixelRatio and route WebGL/Vulkan
+                    // through ANGLE so it renders on the real GPU instead of falling
+                    // back to software (llvmpipe/SwiftShader). Only applies when
+                    // actually running headed against a local DISPLAY — not for
+                    // remote-Grid sessions, which have no local GPU to hand off to.
+                    if (process.env.DISPLAY && !useHeadless) {
+                        chromeOptions.addArguments('--force-device-scale-factor=2');
+                        chromeOptions.addArguments('--lang=en-US');
+                        // ANGLE-over-native-GL on the Mesa d3d12 Gallium driver is the
+                        // path that reaches the real GPU headed (Vulkan/dzn enumerates
+                        // the card but can't drive ANGLE rendering — measured). The
+                        // MESA_* / GALLIUM_DRIVER env in the image select d3d12 + the
+                        // NVIDIA adapter over the AMD iGPU.
+                        chromeOptions.addArguments('--ignore-gpu-blocklist');
+                        chromeOptions.addArguments('--use-gl=angle');
+                        chromeOptions.addArguments('--use-angle=gl');
+                    }
+
                     // Exclude automation switches
                     chromeOptions.excludeSwitches('enable-automation');
                     chromeOptions.setUserPreferences({
@@ -467,66 +531,10 @@ server.tool(
                             };
                         };
 
-                        // 6. chrome.runtime mock
-                        window.chrome.runtime = {
-                            OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-                            OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-                            PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                            PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                            PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-                            RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
-                            connect: function() { return { onDisconnect: { addListener: function() {} }, onMessage: { addListener: function() {} }, postMessage: function() {} }; },
-                            sendMessage: function() {}
-                        };
-
-                        // 7. Mock navigator.plugins and mimeTypes
-                        const pluginData = [
-                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-                            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-                            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
-                        ];
-                        const pluginArray = pluginData.map(p => {
-                            const plugin = Object.create(Plugin.prototype);
-                            Object.defineProperties(plugin, {
-                                name: { value: p.name, enumerable: true },
-                                filename: { value: p.filename, enumerable: true },
-                                description: { value: p.description, enumerable: true },
-                                length: { value: 0, enumerable: true }
-                            });
-                            return plugin;
-                        });
-                        Object.defineProperty(navigator, 'plugins', {
-                            get: () => {
-                                const arr = [...pluginArray];
-                                arr.item = i => arr[i] || null;
-                                arr.namedItem = n => arr.find(p => p.name === n) || null;
-                                arr.refresh = () => {};
-                                return arr;
-                            }
-                        });
-
-                        // 8. Mock navigator.languages
+                        // 6. Mock navigator.languages
                         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 
-                        // 9. WebGL vendor/renderer spoofing
-                        const getParameterProxyHandler = {
-                            apply: function(target, thisArg, args) {
-                                const param = args[0];
-                                if (param === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
-                                if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
-                                return Reflect.apply(target, thisArg, args);
-                            }
-                        };
-                        try {
-                            WebGLRenderingContext.prototype.getParameter = new Proxy(
-                                WebGLRenderingContext.prototype.getParameter, getParameterProxyHandler
-                            );
-                            WebGL2RenderingContext.prototype.getParameter = new Proxy(
-                                WebGL2RenderingContext.prototype.getParameter, getParameterProxyHandler
-                            );
-                        } catch(e) {}
-
-                        // 10. Permissions API mock (for notifications)
+                        // 7. Permissions API mock (for notifications)
                         const originalQuery = window.navigator.permissions.query;
                         window.navigator.permissions.query = function(parameters) {
                             if (parameters.name === 'notifications') {
@@ -535,13 +543,13 @@ server.tool(
                             return originalQuery.apply(this, arguments);
                         };
 
-                        // 11. Mock hardware concurrency (typical desktop value)
+                        // 8. Mock hardware concurrency (typical desktop value)
                         Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 
-                        // 12. Mock deviceMemory (typical desktop value)
+                        // 9. Mock deviceMemory (typical desktop value)
                         Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
 
-                        // 13. Spoof screen dimensions
+                        // 10. Spoof screen dimensions
                         Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
                         Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
                         Object.defineProperty(screen, 'width', { get: () => 1920 });
@@ -549,7 +557,7 @@ server.tool(
                         Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
                         Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
 
-                        // 14. Window outer dimensions
+                        // 11. Window outer dimensions
                         Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
                         Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
                     `;
@@ -678,6 +686,16 @@ server.tool(
             // Use MCP session ID as driver key (HTTP mode) or generate one (STDIO mode)
             const driverKey = mcpSession || `${browser}_${Date.now()}`;
             state.drivers.set(driverKey, driver);
+            // Record this browser's unique profile dir so forceQuitDriver can kill
+            // exactly its processes if it wedges (chrome/msedge report userDataDir;
+            // firefox reports moz:profile).
+            try {
+                const caps = await driver.getCapabilities();
+                const userDataDir = caps.get('chrome')?.userDataDir
+                    || caps.get('msedge')?.userDataDir
+                    || caps.get('moz:profile');
+                state.driverMeta.set(driverKey, { userDataDir });
+            } catch { /* metadata is best-effort; quit still has the timeout */ }
             if (!mcpSession) {
                 state.currentSession = driverKey;
             }
@@ -1560,21 +1578,30 @@ server.tool(
             // Read external state file
             const externalState = readExternalState();
 
-            // Update browser health dynamically
+            // Update browser health dynamically. Probed in parallel with a per-browser
+            // timeout: a single wedged Chrome used to hang this tool for every caller.
             const browserHealth = {};
-            for (const [sessionId, driver] of state.drivers) {
+            await Promise.all([...state.drivers].map(async ([sessionId, driver]) => {
+                let timer;
                 try {
-                    await driver.getTitle();
+                    await Promise.race([
+                        driver.getTitle(),
+                        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('unresponsive (no reply within 3s)')), 3000); })
+                    ]);
                     browserHealth[sessionId] = { status: 'healthy', lastCheck: new Date().toISOString() };
                 } catch (e) {
                     browserHealth[sessionId] = { status: 'unhealthy', error: e.message, lastCheck: new Date().toISOString() };
+                } finally {
+                    clearTimeout(timer);
                 }
-            }
+            }));
 
             // Merge external state with runtime state
             const status = {
                 ...externalState,
                 buildId: BUILD_ID,
+                containerId: CONTAINER_ID,
+                restartHint: `docker restart ${CONTAINER_ID}`,
                 browserHealth,
                 recentErrors: externalState.recentErrors || state.recentErrors,
                 activeSessions: Array.from(state.drivers.keys()),
@@ -1585,8 +1612,12 @@ server.tool(
             // Format as readable text for agents
             let text = `## MCP Selenium Status\n\n`;
             text += `**Build:** ${BUILD_ID}\n`;
+            text += `**Container:** ${CONTAINER_ID} — if this server wedges, restart it with \`docker restart ${CONTAINER_ID}\`\n`;
             text += `**Server Uptime:** ${Math.round(status.serverUptime)}s\n`;
             text += `**Active Sessions:** ${status.activeSessions.length ? status.activeSessions.join(', ') : 'None'}\n`;
+            for (const [sessionId, h] of Object.entries(browserHealth)) {
+                text += `- ${sessionId}: ${h.status}${h.error ? ` — ${h.error}; call close_session to force-kill it` : ''}\n`;
+            }
             if (status.lastErrorUpdate) {
                 text += `**Last Error:** ${status.lastErrorUpdate}\n`;
             }
@@ -1650,14 +1681,12 @@ server.tool(
     async () => {
         try {
             const key = getDriverKey();
-            const driver = key ? state.drivers.get(key) : null;
-            if (!driver) {
+            if (!key || !state.drivers.has(key)) {
                 return { content: [{ type: 'text', text: 'No active browser session to close' }] };
             }
-            await driver.quit();
-            state.drivers.delete(key);
-            state.driverHealth.delete(key);
-            lastToolSuccessAt.delete(key);
+            // Succeeds even when Chrome is wedged: state is released immediately and a
+            // quit that hangs past DRIVER_QUIT_TIMEOUT_MS is replaced by a targeted kill.
+            const outcome = await forceQuitDriver(key, 'close_session');
             // Only clear currentSession in STDIO mode
             if (!getMcpSessionId()) {
                 state.currentSession = null;
@@ -1669,9 +1698,10 @@ server.tool(
                     execSync('rm -rf /tmp/chrome-* /tmp/.org.chromium.* || true', { stdio: 'ignore' });
                 } catch (e) { /* ignore */ }
             }
-            debugLog(`Browser session closed: key=${key}, remaining=${state.drivers.size}`);
+            debugLog(`Browser session closed: key=${key}, outcome=${outcome}, remaining=${state.drivers.size}`);
+            const how = outcome === 'killed' ? ' (browser was unresponsive — force-killed)' : '';
             return {
-                content: [{ type: 'text', text: `Browser session ${key} closed. Remaining active: ${state.drivers.size}` }]
+                content: [{ type: 'text', text: `Browser session ${key} closed${how}. Remaining active: ${state.drivers.size}` }]
             };
         } catch (e) {
             return {
@@ -1778,14 +1808,8 @@ void ResourceTemplate; // keep import reference live to avoid lint warnings
 
 // Cleanup handler
 async function cleanup() {
-    for (const [sessionId, driver] of state.drivers) {
-        try {
-            await driver.quit();
-        } catch (e) {
-            console.error(`Error closing browser session ${sessionId}:`, e);
-        }
-    }
-    state.drivers.clear();
+    // Parallel + time-bounded so a wedged browser can't stall container shutdown.
+    await Promise.all([...state.drivers.keys()].map((k) => forceQuitDriver(k, 'shutdown')));
     state.currentSession = null;
     process.exit(0);
 }
@@ -1827,12 +1851,21 @@ if (transportMode === 'stdio') {
     // StreamableHTTPServerTransport needs to read the raw request stream
     app.all('/mcp', async (req, res) => {
         debugLog(`MCP request received: method=${req.method}`);
-        const sessionId = req.headers['mcp-session-id'] || randomUUID();
+        const presentedId = req.headers['mcp-session-id'];
+        const sessionId = presentedId || randomUUID();
         debugLog(`Session ID: ${sessionId}`);
 
         let session = sessions.get(sessionId);
 
+        // A DELETE for a session we no longer hold is already done — don't resurrect it.
+        if (!session && presentedId && req.method === 'DELETE') {
+            return res.status(200).end();
+        }
+
         if (!session) {
+            // A client presenting an id we don't hold initialized it earlier, before a
+            // reap or a container restart. It won't re-send initialize.
+            const resurrect = !!presentedId;
             // Create a brand-new McpServer + transport dedicated to this session.
             const sessionServer = createMcpServer();
             const transport = new StreamableHTTPServerTransport({
@@ -1849,16 +1882,14 @@ if (transportMode === 'stdio') {
                 console.error(`[TRANSPORT-ERROR] session=${sessionId}: ${err.message}`);
             };
             transport.onclose = () => {
+                // If this transport was reaped and the client has since been resurrected
+                // under the same id, the slot belongs to the new session — touching it
+                // would delete the new session and kill its new browser.
+                if (sessions.get(sessionId)?.transport !== transport) return;
                 console.error(`[SESSION-CLOSED] session=${sessionId}`);
                 sessions.delete(sessionId);
-                const driver = state.drivers.get(sessionId);
-                if (driver) {
-                    driver.quit().catch((e) => console.error(`Error quitting driver for closed session ${sessionId}: ${e.message}`));
-                    state.drivers.delete(sessionId);
-                }
-                state.driverHealth.delete(sessionId);
-                lastToolSuccessAt.delete(sessionId);
-                if (state.currentSession === sessionId) state.currentSession = null;
+                forceQuitDriver(sessionId, 'session-closed')
+                    .catch((e) => console.error(`Error releasing browser for closed session ${sessionId}: ${e.message}`));
             };
 
             // Protocol-level errors (distinct from the transport-level errors above —
@@ -1878,7 +1909,21 @@ if (transportMode === 'stdio') {
             // Connect this session's own MCP server to its own transport
             await sessionServer.connect(transport);
 
-            console.log(`New MCP session: ${sessionId} (build=${BUILD_ID})`);
+            if (resurrect) {
+                // Without this the SDK transport answers every call with 400 "Server not
+                // initialized" until the user manually reconnects — what broke Claude Code
+                // sessions after every selenium-headed restart. Mark the fresh transport
+                // initialized under the client's existing id so the call is simply served.
+                // The old browser is gone; browser tools report "No active browser session".
+                // NOTE: sets StreamableHTTPServerTransport internals (@modelcontextprotocol/sdk
+                // 1.20.0 — validateSession checks _initialized and sessionId). Re-verify on SDK upgrade.
+                transport._initialized = true;
+                transport.sessionId = sessionId;
+                metrics.resurrectedSessions++;
+                console.log(`[SESSION-RESURRECTED] ${sessionId} (build=${BUILD_ID})`);
+            } else {
+                console.log(`New MCP session: ${sessionId} (build=${BUILD_ID})`);
+            }
         } else {
             session.lastSeenAt = Date.now();
         }
@@ -1893,6 +1938,21 @@ if (transportMode === 'stdio') {
             metrics.misrouteGuardTrips++;
             console.error(`[MISROUTE-GUARD] map key=${sessionId} but transport.sessionId=${transport.sessionId}`);
             return res.status(500).json({ error: 'Session misroute detected', expectedSessionId: sessionId, transportSessionId: transport.sessionId });
+        }
+
+        // Track in-flight tool calls (POSTs) so the reaper never evicts a busy session.
+        // handleRequest() returns as soon as the SSE response stream is opened — the tool
+        // call itself runs after that — so completion is the response closing (final
+        // result sent, or the client gone), not the await below. GETs are long-lived SSE
+        // listening streams, not work, so they don't count as busy.
+        if (req.method === 'POST') {
+            const s = session;
+            if (!s.inflight) s.busySince = Date.now();
+            s.inflight = (s.inflight || 0) + 1;
+            res.once('close', () => {
+                s.inflight -= 1;
+                if (s.inflight <= 0) { s.inflight = 0; s.busySince = null; }
+            });
         }
 
         // Handle the request within session context so tool handlers
@@ -1943,11 +2003,7 @@ if (transportMode === 'stdio') {
                 // /health can return 200 again and the container re-enters HAProxy rotation.
                 if (failCount >= 2) {
                     console.error(`Auto-cleanup: removing unrecoverable session ${key}`);
-                    try { await driver.quit(); } catch {}
-                    state.drivers.delete(key);
-                    state.driverHealth.delete(key);
-                    lastToolSuccessAt.delete(key);
-                    if (state.currentSession === key) state.currentSession = null;
+                    await forceQuitDriver(key, 'health-autocleanup');
                 }
             }
         }
@@ -1957,6 +2013,37 @@ if (transportMode === 'stdio') {
         }
     }
     setInterval(runIdleDriverHealthChecks, 15000);
+
+    // Session reaper / watchdog. HTTP MCP clients (Claude Code included) rarely send a
+    // DELETE when they go away, so without this every session ever opened stays in
+    // `sessions` for the life of the container — selenium-headed had accumulated 1,240
+    // when it wedged on 2026-10-19. Idle sessions are evicted (browser sessions get a
+    // longer grace period); a session whose tool call has run past HUNG_REQUEST_MS is
+    // treated as wedged and recycled — its browser is force-killed, which also unblocks
+    // the stuck call. Eviction is invisible to a client that returns later: its next
+    // request is resurrected on a fresh session (see the /mcp route).
+    const SESSION_IDLE_MS = parseInt(process.env.SESSION_IDLE_MS || String(10 * 60 * 1000), 10);
+    const BROWSER_IDLE_MS = parseInt(process.env.BROWSER_IDLE_MS || String(60 * 60 * 1000), 10);
+    const HUNG_REQUEST_MS = parseInt(process.env.HUNG_REQUEST_MS || String(15 * 60 * 1000), 10);
+    function reapSessions() {
+        const now = Date.now();
+        for (const [id, s] of sessions) {
+            const hasBrowser = state.drivers.has(id);
+            let reason = null;
+            if (s.inflight > 0) {
+                if (s.busySince && now - s.busySince >= HUNG_REQUEST_MS) reason = 'hung-request';
+            } else if (now - s.lastSeenAt >= (hasBrowser ? BROWSER_IDLE_MS : SESSION_IDLE_MS)) {
+                reason = 'idle';
+            }
+            if (!reason) continue;
+            sessions.delete(id);
+            metrics.reapedSessions++;
+            console.error(`[SESSION-REAPED] session=${id} reason=${reason} idleSec=${Math.round((now - s.lastSeenAt) / 1000)} browser=${hasBrowser}`);
+            forceQuitDriver(id, `reaper-${reason}`).catch(() => {});
+            Promise.resolve().then(() => s.transport.close()).catch(() => {});
+        }
+    }
+    setInterval(reapSessions, parseInt(process.env.REAP_INTERVAL_MS || '60000', 10));
 
     // Health check endpoint — returns 503 if any active Chrome session has crashed
     // (2+ consecutive health check failures). HAProxy marks this backend DOWN on 503,
@@ -1974,6 +2061,7 @@ if (transportMode === 'stdio') {
             status: crashed.length > 0 ? 'degraded' : 'ok',
             transport: 'streamable-http',
             buildId: BUILD_ID,
+            containerId: CONTAINER_ID,
             sessions: sessionCount,
             browsers: browserCount,
             metrics: { ...metrics }
