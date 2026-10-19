@@ -1,0 +1,101 @@
+FROM node:18-slim
+
+# Build identifier — pass with --build-arg BUILD_ID=<tag> so a running container can
+# be matched back to the image that produced it (see /health and get_mcp_status).
+ARG BUILD_ID=dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
+# Timezone (baked in so all timestamps/JS Date/Intl calls are consistent)
+ENV TZ=America/New_York
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base deps + tini for proper zombie process handling
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
+    fonts-liberation \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-noto \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm1 \
+    libasound2 \
+    tini \
+    procps \
+    curl \
+    wget \
+    unzip \
+    ca-certificates \
+    gnupg \
+    socat \
+    xvfb \
+    # GPU userspace for WebGL — the NVIDIA driver's GL/EGL libraries are injected at
+    # runtime by `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`; Mesa provides the
+    # d3d12/EGL plumbing needed for that to actually be usable from the container.
+    mesa-utils \
+    libgl1-mesa-dri \
+    libglx-mesa0 \
+    libegl1 \
+    libgles2 \
+    libvulkan1 \
+    vainfo \
+    && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install real Google Chrome (stable channel)
+RUN wget -q -O /tmp/google-chrome-stable.deb \
+    https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome-stable.deb \
+    && rm /tmp/google-chrome-stable.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the chromedriver build that exactly matches the installed Chrome version
+# from Chrome for Testing, so selenium-webdriver picks it up off PATH instead of
+# reaching for Selenium Manager (which needs runtime egress the fleet may not have).
+RUN CHROME_FULL_VERSION="$(google-chrome --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')" \
+    && echo "Detected Chrome version: $CHROME_FULL_VERSION" \
+    && wget -q -O /tmp/chromedriver.zip \
+    "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_FULL_VERSION}/linux64/chromedriver-linux64.zip" \
+    && unzip -q /tmp/chromedriver.zip -d /tmp \
+    && mv /tmp/chromedriver-linux64/chromedriver /usr/bin/chromedriver \
+    && chmod +x /usr/bin/chromedriver \
+    && rm -rf /tmp/chromedriver.zip /tmp/chromedriver-linux64
+
+# Set Chrome environment variables
+ENV CHROME_BIN=/usr/bin/google-chrome
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Pre-download Firefox and geckodriver via Selenium Manager during build
+# This ensures they're cached and available at runtime (airlocked network can't download)
+# Make accessible to all users (container may run as non-root)
+RUN ./node_modules/selenium-webdriver/bin/linux/selenium-manager --browser firefox --output JSON && \
+    chmod 755 /root && \
+    chmod -R 755 /root/.cache
+
+# Copy application code
+COPY . .
+
+# Make entrypoint script executable
+RUN sed -i 's/\r$//' docker-entrypoint.sh && chmod +x docker-entrypoint.sh
+
+# Expose port for HTTP/SSE mode
+EXPOSE 3000
+
+# Use tini as init to properly reap zombie processes
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
+
+# Default to stdio mode; use --http or --sse for HTTP transport
+CMD []

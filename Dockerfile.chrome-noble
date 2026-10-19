@@ -1,0 +1,112 @@
+FROM ubuntu:24.04
+
+# Build identifier — pass with --build-arg BUILD_ID=<tag> so a running container can
+# be matched back to the image that produced it (see /health and get_mcp_status).
+ARG BUILD_ID=dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
+# Timezone (baked in so all timestamps/JS Date/Intl calls are consistent)
+ENV TZ=America/New_York
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base deps + tini for proper zombie process handling.
+# Ubuntu 24.04 ships Mesa 24.x, which is what actually carries the `dzn` (Dozen,
+# Vulkan-on-D3D12) ICD needed for WSL2 GPU passthrough graphics — Debian 12's Mesa
+# 22.3.6 (used by Dockerfile.chrome's node:18-slim base) does not have it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
+    curl \
+    wget \
+    unzip \
+    gnupg \
+    ca-certificates \
+    fonts-liberation \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-noto \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm1 \
+    libasound2t64 \
+    tini \
+    procps \
+    socat \
+    xvfb \
+    build-essential \
+    # GPU userspace for WebGL — the NVIDIA driver's compute libraries are injected at
+    # runtime by `--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`; Mesa 24's dzn ICD plus
+    # the WSL2 D3D12 usermode driver (mounted at runtime from the host) provide the
+    # Vulkan-on-D3D12 graphics path needed for real hardware-accelerated WebGL.
+    mesa-utils \
+    libgl1-mesa-dri \
+    libglx-mesa0 \
+    libegl-mesa0 \
+    mesa-vulkan-drivers \
+    vulkan-tools \
+    libvulkan1 \
+    vainfo \
+    && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 via NodeSource
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install real Google Chrome (stable channel)
+RUN wget -q -O /tmp/google-chrome-stable.deb \
+    https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome-stable.deb \
+    && rm /tmp/google-chrome-stable.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the chromedriver build that exactly matches the installed Chrome version
+# from Chrome for Testing, so selenium-webdriver picks it up off PATH instead of
+# reaching for Selenium Manager (which needs runtime egress the fleet may not have).
+RUN CHROME_FULL_VERSION="$(google-chrome --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')" \
+    && echo "Detected Chrome version: $CHROME_FULL_VERSION" \
+    && wget -q -O /tmp/chromedriver.zip \
+    "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_FULL_VERSION}/linux64/chromedriver-linux64.zip" \
+    && unzip -q /tmp/chromedriver.zip -d /tmp \
+    && mv /tmp/chromedriver-linux64/chromedriver /usr/bin/chromedriver \
+    && chmod +x /usr/bin/chromedriver \
+    && rm -rf /tmp/chromedriver.zip /tmp/chromedriver-linux64
+
+# Set Chrome environment variables
+ENV CHROME_BIN=/usr/bin/google-chrome
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci || npm install
+
+# Pre-download Firefox and geckodriver via Selenium Manager during build
+# This ensures they're cached and available at runtime (airlocked network can't download)
+# Make accessible to all users (container may run as non-root)
+RUN ./node_modules/selenium-webdriver/bin/linux/selenium-manager --browser firefox --output JSON && \
+    chmod 755 /root && \
+    chmod -R 755 /root/.cache
+
+# Copy application code
+COPY . .
+
+# Make entrypoint script executable
+RUN sed -i 's/\r$//' docker-entrypoint.sh && chmod +x docker-entrypoint.sh
+
+# Expose port for HTTP/SSE mode
+EXPOSE 3000
+
+# Use tini as init to properly reap zombie processes
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
+
+# Default to stdio mode; use --http or --sse for HTTP transport
+CMD []
