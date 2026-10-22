@@ -3,11 +3,13 @@
 #   docker compose -f docker-compose.fleet.yml up -d
 #
 # selenium-1 and selenium-2 are permanent baseline workers (always running).
-# selenium-3 through selenium-10 are created/removed dynamically by the autoscaler
+# selenium-3 through selenium-14 are created/removed dynamically by the autoscaler
 # as agent demand increases and decreases.
 #
-# HAProxy has all 10 backends pre-declared; health checks bring them in/out of
-# rotation automatically as the autoscaler starts and removes containers.
+# HAProxy declares only the permanent workers. The autoscaler registers dynamic workers
+# through HAProxy's runtime API (stats socket :9999 on the compose network), by container
+# IP — never by polling Docker DNS for names that may not exist (that flooded dockerd's log
+# and deadlocked the Docker engine on 2026-10-22).
 #
 # Claude Code config (in ~/.claude.json mcpServers):
 #   "selenium": { "type": "http", "url": "http://localhost:3100/mcp" }
@@ -43,6 +45,7 @@ services:
       DOCKER_NETWORK: selenium-mcp_default
       DOCKER_VOLUME: selenium-mcp_selenium-data
       WORKER_IMAGE: selenium-mcp
+      HAPROXY_ADMIN: "haproxy:9999"  # HAProxy runtime API (dynamic worker registration)
       MIN_WORKERS: "2"
       MAX_WORKERS: "14"
       WORKER_MEMORY: "2g"            # memory cap for dynamic workers (2g handles heavy sites like Airbnb)
