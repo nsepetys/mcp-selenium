@@ -35,6 +35,8 @@ ENV DISPLAY=:99
 # 3840x2160 screen; at the base image's 1920x1080 it hung off-screen in noVNC.
 ENV SE_SCREEN_WIDTH=3840
 ENV SE_SCREEN_HEIGHT=2160
+# ...and at 4K, noVNC's default 1:1 view is twice the viewer's size, so scale to fit.
+RUN printf '{"resize":"scale","autoconnect":true}\n' > /opt/bin/noVNC/defaults.json
 # Cap the Selenium Grid JVM heap — without this it can grow to 1GB+
 ENV JAVA_OPTS="-Xmx512m -Xms128m -XX:+UseG1GC -XX:+UseContainerSupport"
 
