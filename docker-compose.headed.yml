@@ -34,6 +34,9 @@ x-worker: &worker
   cpus: 2
   volumes:
     - /usr/lib/wsl:/usr/lib/wsl:ro
+    # Shared with selenium-vnc: screenshots, mcp-state.json and agent-feedback.jsonl
+    # survive worker recreation and are readable on the host.
+    - C:/Users/Noah/Scratch/selenium-mcp:/data
   deploy:
     resources:
       reservations:
