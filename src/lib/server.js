@@ -14,6 +14,7 @@ import { Options as FirefoxOptions } from 'selenium-webdriver/firefox.js';
 import { Options as EdgeOptions } from 'selenium-webdriver/edge.js';
 import fs from 'fs';
 import os from 'os';
+import net from 'net';
 import { execFileSync } from 'child_process';
 import { AsyncLocalStorage } from 'async_hooks';
 
@@ -60,6 +61,9 @@ function debugLog(msg) {
 // Startup log to confirm module loads
 fs.writeFileSync('/tmp/server-startup.txt', `Server module loaded at ${new Date().toISOString()}\n`);
 debugLog('Server module loaded');
+
+// Max concurrent browsers in this process; 0 = unlimited (the fleet, which scales by worker).
+const MAX_BROWSERS = parseInt(process.env.MAX_BROWSERS || '0', 10);
 
 // Server state
 const state = {
@@ -355,6 +359,15 @@ server.tool(
                     execSync('pkill -9 chrome || true', { stdio: 'ignore' });
                     execSync('rm -rf /tmp/chrome-* /tmp/.org.chromium.* || true', { stdio: 'ignore' });
                 } catch (e) { /* ignore cleanup errors */ }
+            }
+
+            // Per-worker browser cap (headed pool): each headed Chrome costs ~1 GB, so refuse
+            // rather than overcommit the container. This session's own browser was already
+            // quit above, so a replace never counts against the cap.
+            if (MAX_BROWSERS > 0 && state.drivers.size >= MAX_BROWSERS) {
+                return {
+                    content: [{ type: 'text', text: `Error starting browser: this worker (${os.hostname()}) is at its limit of ${MAX_BROWSERS} browsers. Retry in a few minutes, or reconnect the MCP server (/mcp) to be routed to a less busy worker.` }]
+                };
             }
 
             const remoteUrl = process.env.SELENIUM_REMOTE_URL || null;
@@ -720,7 +733,7 @@ server.tool(
             const activeBrowsers = state.drivers.size;
             debugLog(`Browser started: key=${driverKey}, active_browsers=${activeBrowsers}`);
             return {
-                content: [{ type: 'text', text: `Browser started with session_id: ${driverKey}\nContainer: ${containerId}\nActive browsers: ${activeBrowsers}` }]
+                content: [{ type: 'text', text: `Browser started with session_id: ${driverKey}\nContainer: ${containerId}\nActive browsers: ${activeBrowsers}${process.env.VNC_URL ? `\nWatch it: ${process.env.VNC_URL}` : ''}` }]
             };
         } catch (e) {
             recordError('start_browser', e);
@@ -2093,6 +2106,24 @@ if (transportMode === 'stdio') {
         console.log(`  MCP endpoint: http://0.0.0.0:${port}/mcp`);
         console.log(`  Health check: http://0.0.0.0:${port}/health`);
     });
+
+    // HAProxy agent-check (headed pool): report free browser slots as a weight so new MCP
+    // sessions land on the emptiest worker. A full worker reports 1%, not "drain": with every
+    // worker drained HAProxy refuses new MCP connections outright, so a Claude session starting
+    // while the pool is full would lose the server even if it never opens a browser. At 1% it
+    // still connects, and start_browser returns the MAX_BROWSERS "retry" error instead.
+    const agentPort = parseInt(process.env.AGENT_CHECK_PORT || '0', 10);
+    if (agentPort && MAX_BROWSERS > 0) {
+        net.createServer((sock) => {
+            // HAProxy resets the connection once it has read the reply; an unhandled
+            // socket error would crash the whole server.
+            sock.on('error', () => {});
+            const free = MAX_BROWSERS - state.drivers.size;
+            sock.end(`ready ${free > 0 ? Math.round(100 * free / MAX_BROWSERS) : 1}%\n`);
+        }).listen(agentPort, '0.0.0.0', () => {
+            console.log(`  Agent check: tcp://0.0.0.0:${agentPort} (max ${MAX_BROWSERS} browsers)`);
+        });
+    }
 } else {
     console.error(`Unknown transport mode: ${transportMode}`);
     process.exit(1);

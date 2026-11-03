@@ -1,5 +1,6 @@
 ---
-# selenium-headed — headed, GPU-accelerated, host-mimicking Chrome MCP server.
+# selenium-headed — a pool of 3 headed, GPU-accelerated, host-mimicking Chrome MCP workers
+# behind one HAProxy, so several agents can run headed browsers in parallel.
 #
 # Bring it up (or back) with:
 #   docker compose -f docker-compose.headed.yml up -d
@@ -9,9 +10,14 @@
 # container was silently deleted once (2026-10-02) and a restart policy can't undo a
 # deletion — this file makes recovery one command and keeps the config versioned.
 #
-# Claude Code config (~/.claude.json mcpServers):
+# Claude Code config (~/.claude.json mcpServers), unchanged from the single container:
 #   "selenium-headed": { "type": "http", "url": "http://localhost:3200/mcp" }
-# Watch the live browser: http://localhost:7950 (noVNC)
+# Watch a worker's desktop (start_browser prints which one): http://localhost:7950 / 7951 / 7952
+#
+# Sizing: each worker gets its own 4K X display, is capped at 4 GB / 2 CPUs and refuses a
+# 3rd browser (MAX_BROWSERS), so the pool tops out at 6 browsers / 12 GB instead of
+# growing until Docker or the host runs out of memory. The pool is FIXED size on purpose:
+# HAProxy only ever resolves names that always exist (see haproxy-headed.cfg).
 #
 # Image: built from Dockerfile.chrome-headed, which layers on the local
 # selenium-mcp:chrome-dzn image (Mesa d3d12 GPU driver compiled from source — that
@@ -19,42 +25,80 @@
 
 name: selenium-headed
 
+x-worker: &worker
+  image: selenium-mcp:chrome-headed
+  restart: unless-stopped
+  shm_size: 1g
+  mem_limit: 4g
+  memswap_limit: 4g
+  cpus: 2
+  volumes:
+    - /usr/lib/wsl:/usr/lib/wsl:ro
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "--max-time", "5", "http://localhost:3000/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+x-worker-env: &worker-env
+  # GPU passthrough on Docker Desktop/WSL2: the D3D12 runtime comes from the
+  # host's /usr/lib/wsl (mounted above). The d3d12/NVIDIA-adapter selection env
+  # and Chrome's --use-angle=gl default are baked into the image.
+  NVIDIA_DRIVER_CAPABILITIES: all
+  LD_LIBRARY_PATH: /usr/lib/wsl/lib
+  LOCALHOST_FORWARD_PORTS: ""
+  MAX_BROWSERS: "2"             # per worker; the 3rd start_browser is refused
+  AGENT_CHECK_PORT: "3001"      # free-slot weight reported to HAProxy
+  # Session reaper / watchdog (see src/lib/server.js reapSessions)
+  SESSION_IDLE_MS: "600000"     # evict browser-less sessions idle 10 min
+  BROWSER_IDLE_MS: "3600000"    # evict sessions with a browser idle 60 min
+  HUNG_REQUEST_MS: "900000"     # recycle a session whose tool call runs > 15 min
+  DRIVER_QUIT_TIMEOUT_MS: "10000"
+
 services:
-  selenium-headed:
-    image: selenium-mcp:chrome-headed
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: selenium-headed-lb
+    restart: unless-stopped
+    ports:
+      - "3200:80"     # MCP endpoint → http://localhost:3200/mcp
+    volumes:
+      - ./haproxy-headed.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  selenium-headed-1:
+    <<: *worker
     build:
       context: .
       dockerfile: Dockerfile.chrome-headed
-    container_name: selenium-headed
-    restart: unless-stopped
-    shm_size: 1g
+    container_name: selenium-headed-1
     environment:
-      # GPU passthrough on Docker Desktop/WSL2: the D3D12 runtime comes from the
-      # host's /usr/lib/wsl (mounted below). The d3d12/NVIDIA-adapter selection env
-      # and Chrome's --use-angle=gl default are baked into the image.
-      NVIDIA_DRIVER_CAPABILITIES: all
-      LD_LIBRARY_PATH: /usr/lib/wsl/lib
-      LOCALHOST_FORWARD_PORTS: ""
-      # Session reaper / watchdog (see src/lib/server.js reapSessions)
-      SESSION_IDLE_MS: "600000"     # evict browser-less sessions idle 10 min
-      BROWSER_IDLE_MS: "3600000"    # evict sessions with a browser idle 60 min
-      HUNG_REQUEST_MS: "900000"     # recycle a session whose tool call runs > 15 min
-      DRIVER_QUIT_TIMEOUT_MS: "10000"
-    volumes:
-      - /usr/lib/wsl:/usr/lib/wsl:ro
+      <<: *worker-env
+      VNC_URL: "http://localhost:7950/vnc.html?autoconnect=1&resize=scale"
     ports:
-      - "3200:3000"   # MCP endpoint
       - "7950:7900"   # noVNC (7900 on the host is taken by the Swaffham grid)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "--max-time", "5", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+
+  selenium-headed-2:
+    <<: *worker
+    container_name: selenium-headed-2
+    environment:
+      <<: *worker-env
+      VNC_URL: "http://localhost:7951/vnc.html?autoconnect=1&resize=scale"
+    ports:
+      - "7951:7900"
+
+  selenium-headed-3:
+    <<: *worker
+    container_name: selenium-headed-3
+    environment:
+      <<: *worker-env
+      VNC_URL: "http://localhost:7952/vnc.html?autoconnect=1&resize=scale"
+    ports:
+      - "7952:7900"

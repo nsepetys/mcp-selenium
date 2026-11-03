@@ -12,6 +12,9 @@ chmod 700 "$XDG_RUNTIME_DIR"
 
 # 3840x2160 = a 1920x1080 desktop at the 2x scale server.js forces when headed, so the
 # 1920x1080-DIP window fits the screen (at 1920x1080 it overflowed to 3840x2160 px).
+# A restart (restart: unless-stopped) reuses the container filesystem, and a leftover
+# lock makes Xvfb refuse to start ("Server is already active for display 99").
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
 echo "[start-headed] launching Xvfb :99 (3840x2160x30)..."
 Xvfb :99 -screen 0 3840x2160x30 -ac +extension GLX +render &
 export DISPLAY=:99
