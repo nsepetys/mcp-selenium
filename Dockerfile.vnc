@@ -31,6 +31,10 @@ COPY . .
 ENV SE_NODE_MAX_SESSIONS=1
 ENV SE_SESSION_REQUEST_TIMEOUT=300
 ENV DISPLAY=:99
+# server.js forces a 2x scale factor when headed, so the 1920x1080-DIP window needs a
+# 3840x2160 screen; at the base image's 1920x1080 it hung off-screen in noVNC.
+ENV SE_SCREEN_WIDTH=3840
+ENV SE_SCREEN_HEIGHT=2160
 # Cap the Selenium Grid JVM heap — without this it can grow to 1GB+
 ENV JAVA_OPTS="-Xmx512m -Xms128m -XX:+UseG1GC -XX:+UseContainerSupport"
 

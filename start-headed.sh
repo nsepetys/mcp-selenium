@@ -10,8 +10,10 @@ export XDG_RUNTIME_DIR=/tmp/runtime
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
-echo "[start-headed] launching Xvfb :99 (1920x1080x30)..."
-Xvfb :99 -screen 0 1920x1080x30 -ac +extension GLX +render &
+# 3840x2160 = a 1920x1080 desktop at the 2x scale server.js forces when headed, so the
+# 1920x1080-DIP window fits the screen (at 1920x1080 it overflowed to 3840x2160 px).
+echo "[start-headed] launching Xvfb :99 (3840x2160x30)..."
+Xvfb :99 -screen 0 3840x2160x30 -ac +extension GLX +render &
 export DISPLAY=:99
 
 echo "[start-headed] waiting for display :99..."

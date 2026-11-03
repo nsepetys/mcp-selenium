@@ -475,6 +475,22 @@ server.tool(
                         buildTimeout
                     ]);
 
+                    // Headed: --window-size is in DIPs, so with a forced scale factor the window can
+                    // come out larger than the X screen and hang off its top-left (unusable in noVNC,
+                    // and outerWidth > screen.width is a bot tell). Clamp it to the screen.
+                    if (process.env.DISPLAY && !useHeadless) {
+                        try {
+                            const s = await driver.executeScript('return [screen.availWidth, screen.availHeight]');
+                            const r = await driver.manage().window().getRect();
+                            if (r.x < 0 || r.y < 0 || r.x + r.width > s[0] || r.y + r.height > s[1]) {
+                                await driver.manage().window().setRect({ x: 0, y: 0, width: s[0], height: s[1] });
+                                console.error(`Window ${r.width}x${r.height}@${r.x},${r.y} exceeded screen ${s[0]}x${s[1]}; resized to fit`);
+                            }
+                        } catch (e) {
+                            console.error(`Window fit check failed: ${e.message}`);
+                        }
+                    }
+
                     // Comprehensive stealth JavaScript (mimics puppeteer-extra-plugin-stealth)
                     // Use CDP to inject BEFORE page scripts execute
                     const stealthScript = `
