@@ -1,0 +1,61 @@
+# Selenium MCP with VNC support (non-headless)
+# View browser at http://localhost:7900 (noVNC) or VNC client on port 5900
+FROM selenium/standalone-chrome:latest
+
+# Build identifier — pass with --build-arg BUILD_ID=<tag> so a running container can
+# be matched back to the image that produced it (see /health and get_mcp_status).
+ARG BUILD_ID=dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
+USER root
+
+# Install Node.js 18
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    apt-get install -y nodejs && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy application code
+COPY . .
+
+# Environment variables for Chrome
+ENV SE_NODE_MAX_SESSIONS=1
+ENV SE_SESSION_REQUEST_TIMEOUT=300
+ENV DISPLAY=:99
+# server.js forces a 2x scale factor when headed, so the 1920x1080-DIP window needs a
+# 3840x2160 screen; at the base image's 1920x1080 it hung off-screen in noVNC.
+ENV SE_SCREEN_WIDTH=3840
+ENV SE_SCREEN_HEIGHT=2160
+# ...and at 4K, noVNC's default 1:1 view is twice the viewer's size, so scale to fit.
+RUN printf '{"resize":"scale","autoconnect":true}\n' > /opt/bin/noVNC/defaults.json
+# Cap the Selenium Grid JVM heap — without this it can grow to 1GB+
+ENV JAVA_OPTS="-Xmx512m -Xms128m -XX:+UseG1GC -XX:+UseContainerSupport"
+
+# Expose ports: 3000 (MCP), 7900 (noVNC), 5900 (VNC)
+EXPOSE 3000 7900 5900
+
+# Create startup script that runs both supervisor (for Chrome/VNC) and MCP server
+RUN printf '#!/bin/bash\n\
+/opt/bin/entry_point.sh &\n\
+# Wait for Xvfb display to be ready before starting the MCP server.\n\
+# We do NOT wait for Selenium Grid — the MCP server uses ChromeDriver directly.\n\
+for i in $(seq 1 30); do\n\
+  if xdpyinfo -display :99 > /dev/null 2>&1; then break; fi\n\
+  sleep 1\n\
+done\n\
+exec node src/lib/server.js\n\
+' > /app/start.sh && chmod +x /app/start.sh
+
+# Switch back to selenium user
+USER seluser
+
+CMD ["/app/start.sh"]

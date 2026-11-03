@@ -1,0 +1,153 @@
+# ---------------------------------------------------------------------------
+# Stage 1: dzn-builder — compile ONLY the Mesa `dzn` (Dozen, Vulkan-on-D3D12)
+# Vulkan ICD from source. Stock Ubuntu 24.04 mesa-vulkan-drivers (25.2.8) ships
+# lvp/radeon/nouveau/intel/virtio/asahi/gfxstream ICDs but NOT dzn, so it has to
+# be built out-of-band and dropped into the runtime image. Built against the
+# exact same Mesa point release (25.2.8) as the base image's installed Mesa to
+# keep everything ABI-compatible.
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS dzn-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ninja-build \
+    python3 \
+    python3-pip \
+    python3-mako \
+    python3-yaml \
+    python3-setuptools \
+    pkg-config \
+    cmake \
+    git \
+    ca-certificates \
+    wget \
+    xz-utils \
+    bison \
+    flex \
+    libdrm-dev \
+    libvulkan-dev \
+    libexpat1-dev \
+    zlib1g-dev \
+    llvm-15-dev \
+    libclang-dev \
+    libelf-dev \
+    directx-headers-dev \
+    spirv-tools \
+    libspirv-cross-c-shared-dev \
+    glslang-tools \
+    libwayland-dev \
+    wayland-protocols \
+    libxrandr-dev \
+    libxxf86vm-dev \
+    libxcb-glx0-dev \
+    libx11-xcb-dev \
+    libxcb-dri2-0-dev \
+    libxcb-dri3-dev \
+    libxcb-present-dev \
+    libxshmfence-dev \
+    libxcb-sync-dev \
+    libxcb-xfixes0-dev \
+    libxcb-randr0-dev \
+    libxcb-shm0-dev \
+    libxcb-keysyms1-dev \
+    libxext-dev \
+    libx11-dev \
+    libgbm-dev \
+    libegl-dev \
+    libgles2-mesa-dev \
+    libwayland-egl-backend-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Mesa source — pinned to 25.2.8, the exact version already installed in the
+# selenium-mcp:chrome-gpu-noble runtime base, for ABI/ICD-schema compatibility.
+RUN wget -q https://archive.mesa3d.org/mesa-25.2.8.tar.xz \
+    && tar xf mesa-25.2.8.tar.xz \
+    && rm mesa-25.2.8.tar.xz
+
+WORKDIR /build/mesa-25.2.8
+
+# Build the dzn (microsoft-experimental) Vulkan driver AND the d3d12 Gallium
+# OpenGL driver (d3d12_dri.so) — the other D3D12-backed GPU path, used via
+# ANGLE-over-native-GL instead of ANGLE-over-Vulkan. GL/EGL/GBM/GLX are
+# re-enabled so the d3d12 gallium driver + its loader plumbing actually get
+# built. No video codecs, X11 platform only (no wayland).
+# --wrap-mode=default lets meson subprojects (e.g. any bundled fallback) fetch
+# over the network if a -dev package isn't sufficient.
+RUN pip3 install --break-system-packages 'meson>=1.6.0' \
+    && meson setup build \
+        -Dvulkan-drivers=microsoft-experimental \
+        -Dgallium-drivers=d3d12 \
+        -Dvideo-codecs= \
+        -Dplatforms=x11 \
+        -Dglx=dri \
+        -Degl=enabled \
+        -Dgbm=enabled \
+        -Dopengl=true \
+        -Dllvm=enabled \
+        -Dshared-llvm=enabled \
+        -Dbuildtype=release \
+        --wrap-mode=default \
+    && ninja -C build
+
+# Locate + report artifacts and their non-system deps (build log only; the
+# actual copy into the runtime stage happens explicitly below once paths are
+# confirmed stable across Mesa releases).
+RUN echo "=== libvulkan_dzn.so ===" \
+    && find build -name 'libvulkan_dzn.so' -exec cp {} /build/libvulkan_dzn.so \; \
+    && echo "=== dzn_icd*.json ===" \
+    && find build -name 'dzn_icd*.json' -exec cp {} /build/dzn_icd.x86_64.json \; \
+    && echo "=== d3d12_dri.so ===" \
+    && find build -name 'd3d12_dri.so' -exec cp {} /build/d3d12_dri.so \; \
+    && echo "=== libgbm/libEGL/libGL (if built as part of this tree) ===" \
+    && find build -name 'libgbm.so*' -exec cp -P {} /build/ \; \
+    && find build -name 'libEGL.so*' -exec cp -P {} /build/ \; \
+    && find build -name 'libGL.so*' -exec cp -P {} /build/ \; \
+    && find build -name 'libglapi.so*' -exec cp -P {} /build/ \; \
+    && ls -la /build/*.so* 2>/dev/null || true \
+    && echo "=== ldd libvulkan_dzn.so ===" \
+    && ldd /build/libvulkan_dzn.so \
+    && echo "=== ldd d3d12_dri.so ===" \
+    && ldd /build/d3d12_dri.so \
+    && echo "=== non-system (mesa-local) deps ===" \
+    && ldd /build/libvulkan_dzn.so /build/d3d12_dri.so | grep -iE 'build/|not found' || echo "none — all deps resolve to system libs"
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime — extend the existing coherent-Chrome GPU image with the
+# freshly built dzn ICD. Everything else (Chrome, chromedriver, fonts, Mesa
+# 25.2.8 userspace, Node/app code) is inherited unchanged from chrome-gpu-noble.
+# ---------------------------------------------------------------------------
+FROM selenium-mcp:chrome-gpu-noble AS runtime
+
+ARG BUILD_ID=chrome-dzn-dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
+COPY --from=dzn-builder /build/libvulkan_dzn.so /usr/lib/x86_64-linux-gnu/libvulkan_dzn.so
+COPY --from=dzn-builder /build/dzn_icd.x86_64.json /usr/share/vulkan/icd.d/dzn_icd.x86_64.json
+
+# The D3D12 Gallium OpenGL driver (the other D3D12-backed GPU path, used via
+# ANGLE-over-native-GL instead of ANGLE-over-Vulkan). Dropped into the same
+# DRI driver directory the base image's stock libgl1-mesa-dri package uses, so
+# Mesa's loader can pick it up via MESA_LOADER_DRIVER_OVERRIDE=d3d12 without
+# needing a real /dev/dri KMS device — the base image already ships
+# libgl1-mesa-dri/libglx-mesa0/libegl-mesa0 (Ubuntu 24.04 stock Mesa) which
+# provide the GLX/EGL loader side; only the driver backend itself is custom.
+#
+# IMPORTANT: Ubuntu packages every Gallium DRI driver (swrast, zink, d3d12,
+# radeonsi, ...) as a symlink to ONE shared "megadriver" blob, libdril_dri.so.
+# d3d12_dri.so is one of those symlinks in the base image. `COPY` follows an
+# existing destination symlink and writes *through* it — so copying straight
+# onto d3d12_dri.so would silently overwrite libdril_dri.so (and therefore
+# swrast_dri.so/zink_dri.so/etc too) with our single-driver build, breaking
+# every other Gallium driver name in the image. Remove the symlink first so
+# COPY creates a new, independent regular file instead.
+RUN rm -f /usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so
+COPY --from=dzn-builder /build/d3d12_dri.so /usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so
+
+RUN ldconfig \
+    && sed -i 's#"library_path":[[:space:]]*"[^"]*"#"library_path": "libvulkan_dzn.so"#' /usr/share/vulkan/icd.d/dzn_icd.x86_64.json \
+    && cat /usr/share/vulkan/icd.d/dzn_icd.x86_64.json \
+    && ls -la /usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so

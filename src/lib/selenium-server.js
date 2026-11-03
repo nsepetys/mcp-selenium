@@ -5,6 +5,16 @@ import firefox from 'selenium-webdriver/firefox.js';
 import { Options as ChromeOptions } from 'selenium-webdriver/chrome.js';
 import { Options as FirefoxOptions } from 'selenium-webdriver/firefox.js';
 import crypto from 'crypto';
+import fs from 'fs';
+
+// Debug logging to file (since console.error may not appear in docker logs)
+const DEBUG_LOG = '/tmp/selenium-debug.log';
+function debugLog(msg) {
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] ${msg}\n`;
+    fs.appendFileSync(DEBUG_LOG, line);
+    console.error(msg);
+}
 
 export class SeleniumServer {
     constructor() {
@@ -13,6 +23,7 @@ export class SeleniumServer {
     }
 
     async startBrowser(browser, options = {}) {
+        console.error(`[DEBUG] startBrowser called with browser=${browser}, options=${JSON.stringify(options)}`);
         try {
             let builder = new Builder();
             let driver;
@@ -24,6 +35,13 @@ export class SeleniumServer {
 
             // Send initial status message
             this._sendProgress('Initializing browser session...');
+
+            // Check for remote Selenium server
+            const remoteUrl = process.env.SELENIUM_REMOTE_URL;
+            if (remoteUrl) {
+                this._sendProgress(`Connecting to remote Selenium server: ${remoteUrl}`);
+                builder = builder.usingServer(remoteUrl);
+            }
 
             if (browser === 'chrome') {
                 const chromeOptions = new ChromeOptions();
@@ -40,43 +58,56 @@ export class SeleniumServer {
                 chromeOptions.addArguments('--disable-software-rasterizer');
                 chromeOptions.addArguments('--disable-extensions');
                 chromeOptions.addArguments('--disable-setuid-sandbox');
-                // Prevent Chrome from trying to connect to Google services
+                // Prevent Chrome from trying to connect to Google services (critical for proxy environments)
                 chromeOptions.addArguments('--disable-background-networking');
+                chromeOptions.addArguments('--disable-client-side-phishing-detection');
                 chromeOptions.addArguments('--disable-default-apps');
                 chromeOptions.addArguments('--disable-sync');
+                chromeOptions.addArguments('--disable-translate');
                 chromeOptions.addArguments('--metrics-recording-only');
-                chromeOptions.addArguments('--disable-background-timer-throttling');
-                chromeOptions.addArguments('--disable-backgrounding-occluded-windows');
-                chromeOptions.addArguments('--disable-breakpad');
+                chromeOptions.addArguments('--no-first-run');
+                chromeOptions.addArguments('--safebrowsing-disable-auto-update');
                 chromeOptions.addArguments('--disable-component-update');
                 chromeOptions.addArguments('--disable-domain-reliability');
-                chromeOptions.addArguments('--disable-features=TranslateUI,BlinkGenPropertyTrees');
+                chromeOptions.addArguments('--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OptimizationHints,Translate,MediaRouter,TranslateUI');
                 chromeOptions.addArguments('--disable-hang-monitor');
-                chromeOptions.addArguments('--disable-ipc-flooding-protection');
                 chromeOptions.addArguments('--disable-popup-blocking');
                 chromeOptions.addArguments('--disable-prompt-on-repost');
                 chromeOptions.addArguments('--disable-renderer-backgrounding');
                 chromeOptions.addArguments('--force-color-profile=srgb');
-                chromeOptions.addArguments('--no-first-run');
                 chromeOptions.addArguments('--no-default-browser-check');
+                // Allow access to localhost/loopback addresses
+                chromeOptions.addArguments('--allow-insecure-localhost');
+                chromeOptions.addArguments('--allow-loopback-in-peer-connection');
+                // Disable network namespace isolation that might block loopback
+                chromeOptions.addArguments('--disable-features=NetworkServiceSandbox');
+                // Additional flags to help with localhost access
+                chromeOptions.addArguments('--remote-allow-origins=*');
+                chromeOptions.addArguments('--disable-web-security');
+                // Map localhost hostname to host.docker.internal IP
+                // Note: This only works for hostname "localhost", not IP "127.0.0.1"
+                chromeOptions.addArguments('--host-resolver-rules=MAP localhost 192.168.65.254');
 
                 if (options.arguments) {
                     options.arguments.forEach(arg => chromeOptions.addArguments(arg));
                 }
 
-                // Configure proxy if HTTP_PROXY is set
+                // Configure proxy explicitly via WebDriver for Chrome
+                // Chrome via WebDriver doesn't properly route localhost/127.0.0.1 through env var proxy
                 const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
-                console.error(`DEBUG: HTTP_PROXY=${process.env.HTTP_PROXY}, HTTPS_PROXY=${process.env.HTTPS_PROXY}`);
                 if (proxyUrl) {
-                    const proxyMatch = proxyUrl.match(/https?:\/\/([^\/]+)/);
-                    console.error(`DEBUG: proxyMatch=${JSON.stringify(proxyMatch)}`);
+                    const proxyMatch = proxyUrl.match(/https?:\/\/([^:]+):(\d+)/);
                     if (proxyMatch) {
-                        const proxyServer = proxyMatch[1];
-                        chromeOptions.addArguments(`--proxy-server=${proxyServer}`);
-                        console.error(`✓ Configured Chrome to use proxy: ${proxyServer}`);
+                        const proxyHost = proxyMatch[1];
+                        const proxyPort = parseInt(proxyMatch[2]);
+                        // Use PAC script to force ALL traffic through proxy including localhost
+                        // This is necessary because Chrome normally bypasses proxy for loopback addresses
+                        const pacScript = `function FindProxyForURL(url, host) { return "PROXY ${proxyHost}:${proxyPort}"; }`;
+                        chromeOptions.addArguments(`--proxy-pac-url=data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pacScript).toString('base64')}`);
+                        console.error(`✓ Configured Chrome proxy via PAC: ${proxyHost}:${proxyPort} (all traffic including localhost)`);
                     }
                 } else {
-                    console.error(`DEBUG: No proxy environment variables found`);
+                    console.error('✓ No proxy configured (HTTP_PROXY not set)');
                 }
 
                 this._sendProgress('Setting up Chrome driver (this may take a moment on first run)...');
@@ -96,35 +127,92 @@ export class SeleniumServer {
                         .build();
                 }
             } else if (browser === 'firefox') {
+                debugLog('=== Starting Firefox setup ===');
                 const firefoxOptions = new FirefoxOptions();
+
+                // Set Firefox binary path - check environment variable or use Selenium Manager's cached location
+                const firefoxBin = process.env.FIREFOX_BIN || '/root/.cache/selenium/firefox/linux64/147.0.2/firefox';
+                debugLog(`Setting Firefox binary to: ${firefoxBin}`);
+                firefoxOptions.setBinary(firefoxBin);
+                debugLog(`✓ Firefox binary set`);
+
                 if (options.headless) {
-                    firefoxOptions.addArguments('--headless');
+                    firefoxOptions.addArguments('-headless');
+                    debugLog('✓ Headless mode enabled');
                 }
+
+                // Disable sandbox for container environments
+                firefoxOptions.setPreference('security.sandbox.content.level', 0);
+                debugLog('✓ Sandbox disabled');
+
+                // Disable various Firefox features that cause issues in containers
+                firefoxOptions.setPreference('toolkit.cosmeticAnimations.enabled', false);
+                firefoxOptions.setPreference('media.hardware-video-decoding.enabled', false);
+
+                // Allow Firefox to bypass proxy for localhost - socat handles forwarding to host
+                // Firefox can't properly proxy localhost, so let it connect directly to socat
+                firefoxOptions.setPreference('network.proxy.no_proxies_on', 'localhost, 127.0.0.1');
+                firefoxOptions.setPreference('network.proxy.allow_hijacking_localhost', true);
+                debugLog('✓ Localhost proxy bypass enabled (socat handles forwarding)');
+
                 if (options.arguments) {
                     options.arguments.forEach(arg => firefoxOptions.addArguments(arg));
                 }
 
                 // Configure proxy if HTTP_PROXY is set
+                // Use Firefox native preferences for PAC proxy to force ALL traffic including localhost
                 const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+                debugLog(`HTTP_PROXY env var: ${proxyUrl}`);
                 if (proxyUrl) {
                     const proxyMatch = proxyUrl.match(/https?:\/\/([^:]+):(\d+)/);
+                    debugLog(`Proxy regex match result: ${JSON.stringify(proxyMatch)}`);
                     if (proxyMatch) {
                         const proxyHost = proxyMatch[1];
                         const proxyPort = parseInt(proxyMatch[2]);
-                        firefoxOptions.setProxy({
-                            proxyType: 'manual',
-                            httpProxy: `${proxyHost}:${proxyPort}`,
-                            sslProxy: `${proxyHost}:${proxyPort}`
-                        });
-                        console.error(`Configured Firefox to use proxy: ${proxyHost}:${proxyPort}`);
+                        // PAC script that routes traffic through proxy, EXCEPT localhost (socat handles that)
+                        // Security: localhost can only reach socat in container, not bypass proxy for internet
+                        const pacScript = `function FindProxyForURL(url, host) { if (host === 'localhost' || host === '127.0.0.1') return 'DIRECT'; return "PROXY ${proxyHost}:${proxyPort}"; }`;
+                        const pacUrl = `data:application/x-ns-proxy-autoconfig;base64,${Buffer.from(pacScript).toString('base64')}`;
+
+                        debugLog(`PAC script: ${pacScript}`);
+                        debugLog(`PAC URL: ${pacUrl}`);
+
+                        // Set proxy via Firefox native preferences (type 2 = PAC)
+                        // This is more reliable than the WebDriver proxy API
+                        firefoxOptions.setPreference('network.proxy.type', 2);
+                        firefoxOptions.setPreference('network.proxy.autoconfig_url', pacUrl);
+                        debugLog(`✓ Configured Firefox proxy via native prefs PAC: ${proxyHost}:${proxyPort}`);
+                    } else {
+                        debugLog('✗ Proxy URL did not match regex pattern');
                     }
+                } else {
+                    debugLog('✗ No HTTP_PROXY env var found');
                 }
 
                 this._sendProgress('Setting up Firefox driver (this may take a moment on first run)...');
-                driver = await builder
-                    .forBrowser('firefox')
-                    .setFirefoxOptions(firefoxOptions)
-                    .build();
+
+                // Use geckodriver from Selenium Manager cache
+                const geckodriverPath = process.env.GECKODRIVER_PATH || '/root/.cache/selenium/geckodriver/linux64/0.36.0/geckodriver';
+                debugLog(`Using geckodriver: ${geckodriverPath}`);
+                const firefoxService = new firefox.ServiceBuilder(geckodriverPath);
+
+                // Log the Firefox options for debugging
+                debugLog(`FirefoxOptions object created, about to build driver...`);
+
+                debugLog('Building Firefox driver...');
+                try {
+                    driver = await builder
+                        .forBrowser('firefox')
+                        .setFirefoxOptions(firefoxOptions)
+                        .setFirefoxService(firefoxService)
+                        .build();
+                    debugLog('✓ Firefox driver built successfully');
+                    console.error('Firefox driver built successfully');
+                } catch (buildError) {
+                    console.error(`Firefox driver build failed: ${buildError.message}`);
+                    console.error(`Stack: ${buildError.stack}`);
+                    throw buildError;
+                }
             } else {
                 return {
                     content: [

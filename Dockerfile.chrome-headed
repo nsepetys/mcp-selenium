@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Headed, GPU-accelerated, host-mimicking Chrome MCP image.
+#
+# Extends selenium-mcp:chrome-dzn (real Google Chrome + chromedriver, the
+# compiled Mesa `dzn` Vulkan-on-D3D12 ICD, Windows-metric fonts, coherent
+# fingerprint edits) with a virtual display (Xvfb) + VNC/noVNC so Chrome runs
+# HEADED. Headless Chrome has no display surface to hand WebGL/Vulkan frames
+# to, which is why GPU passthrough alone wasn't enough to get real hardware
+# rendering — this image gives it somewhere to draw.
+# ---------------------------------------------------------------------------
+FROM selenium-mcp:chrome-dzn
+
+# Build identifier — pass with --build-arg BUILD_ID=<tag> so a running container
+# can be matched back to the image that produced it (see /health and get_mcp_status).
+ARG BUILD_ID=chrome-headed-dev
+ENV SELENIUM_MCP_BUILD_ID=$BUILD_ID
+
+# Headed/VNC stack. xvfb is already present in the chrome-dzn/chrome-gpu-noble
+# lineage, but it's listed explicitly here so this Dockerfile's requirements
+# are self-contained.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    x11vnc \
+    fluxbox \
+    novnc \
+    websockify \
+    xdg-utils \
+    dbus-x11 \
+    x11-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# The desktop is 4K (see start-headed.sh), so open noVNC scaled to the viewer's
+# window by default; the bare URL otherwise shows a directory listing.
+RUN printf '<meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=1&resize=scale">\n' \
+    > /usr/share/novnc/index.html
+
+COPY start-headed.sh /app/start-headed.sh
+RUN sed -i 's/\r$//' /app/start-headed.sh && chmod +x /app/start-headed.sh
+
+# selenium-mcp:chrome-dzn has its own src/ baked in from whenever it was built,
+# which predates the headed-mode coherence edits (headed-default + host-matching
+# GPU/display Chrome args) in the working tree. Re-copy just this file so the
+# image actually runs the current server.js instead of a stale copy.
+COPY src/lib/server.js /app/src/lib/server.js
+
+# DISPLAY being set is what tells src/lib/server.js's start_browser to default
+# to headed (no --headless) and enable the host-matching GPU/display Chrome flags.
+ENV DISPLAY=:99
+ENV MCP_TRANSPORT=http
+ENV MCP_PORT=3000
+
+# GPU path: use the Mesa d3d12 Gallium OpenGL driver (built into chrome-dzn), and
+# pick the NVIDIA RTX 4060 over the AMD iGPU that D3D12 adapter enumeration
+# otherwise defaults to. ANGLE-over-GL (set in server.js) renders WebGL on this.
+ENV GALLIUM_DRIVER=d3d12
+ENV MESA_LOADER_DRIVER_OVERRIDE=d3d12
+ENV MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+
+# 3000 = MCP HTTP transport, 5900 = raw VNC, 7900 = noVNC (browser-viewable)
+EXPOSE 3000 5900 7900
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/start-headed.sh"]

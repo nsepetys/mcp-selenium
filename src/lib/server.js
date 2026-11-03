@@ -2,29 +2,250 @@
 
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import express from "express";
+import cors from "cors";
+import { randomUUID } from "crypto";
 import pkg from 'selenium-webdriver';
 const { Builder, By, Key, until, Actions } = pkg;
 import { Options as ChromeOptions } from 'selenium-webdriver/chrome.js';
 import { Options as FirefoxOptions } from 'selenium-webdriver/firefox.js';
 import { Options as EdgeOptions } from 'selenium-webdriver/edge.js';
+import fs from 'fs';
+import os from 'os';
+import { execFileSync } from 'child_process';
+import { AsyncLocalStorage } from 'async_hooks';
+
+// AsyncLocalStorage for threading MCP session ID to tool handlers
+// In HTTP mode, each client gets its own mcp-session-id, and we use that
+// to isolate browser sessions so multiple agents can run concurrently.
+const mcpSessionContext = new AsyncLocalStorage();
+
+// Build identifier — stamped at image build time via --build-arg BUILD_ID, surfaced
+// in /health and get_mcp_status so a running container can be matched to its image.
+const BUILD_ID = process.env.SELENIUM_MCP_BUILD_ID || 'dev';
+
+// Cross-session diagnostic counters, exposed via /health and get_mcp_status.
+const metrics = {
+    transportErrors: 0,
+    protocolErrors: 0,
+    misrouteGuardTrips: 0,
+    reapedSessions: 0,       // idle/hung sessions evicted by the session reaper
+    resurrectedSessions: 0,  // unknown session ids served on a fresh pre-initialized session
+    forcedQuits: 0           // driver.quit() timed out and the browser was killed instead
+};
+
+// Container identity (Docker sets the hostname to the short container id), surfaced in
+// /health and get_mcp_status so a wedged instance can be found and restarted directly.
+const CONTAINER_ID = os.hostname();
+
+// driver.quit() against a wedged Chrome never returns. Every quit goes through
+// forceQuitDriver(), which races quit against this timeout and kills the browser's
+// processes if it loses, so no tool call or cleanup can hang behind a dead browser.
+const DRIVER_QUIT_TIMEOUT_MS = parseInt(process.env.DRIVER_QUIT_TIMEOUT_MS || '10000', 10);
+
+// Debug logging to file (console.error doesn't appear in docker logs for some reason)
+const DEBUG_LOG = '/tmp/selenium-debug.log';
+function debugLog(msg) {
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] ${msg}\n`;
+    try {
+        fs.appendFileSync(DEBUG_LOG, line);
+    } catch (e) { /* ignore */ }
+    console.error(msg);
+}
 
 
-// Create an MCP server
-const server = new McpServer({
-    name: "MCP Selenium",
-    version: "1.0.0"
-});
+// Startup log to confirm module loads
+fs.writeFileSync('/tmp/server-startup.txt', `Server module loaded at ${new Date().toISOString()}\n`);
+debugLog('Server module loaded');
 
 // Server state
 const state = {
     drivers: new Map(),
-    currentSession: null
+    currentSession: null,
+    // Dynamic state (populated at runtime)
+    browserHealth: {},
+    recentErrors: [],
+    // Per-driver health tracking: driverKey → { healthy, failCount, checkedAt, error }
+    driverHealth: new Map(),
+    // Per-driver metadata: driverKey → { userDataDir } — lets forceQuitDriver kill
+    // exactly this session's browser processes, never another session's.
+    driverMeta: new Map()
+};
+
+// Release a session's browser without ever hanging on it.
+// State is released FIRST, so even if Chrome is wedged the session is immediately
+// free (a following start_browser/close_session cannot block on the dead browser).
+// Then quit is raced against DRIVER_QUIT_TIMEOUT_MS; on timeout the browser is killed
+// by its unique --user-data-dir, which only this session's Chrome processes carry.
+async function forceQuitDriver(key, reason) {
+    const driver = state.drivers.get(key);
+    const meta = state.driverMeta.get(key);
+    state.drivers.delete(key);
+    state.driverHealth.delete(key);
+    state.driverMeta.delete(key);
+    lastToolSuccessAt.delete(key);
+    if (state.currentSession === key) state.currentSession = null;
+    if (!driver) return 'none';
+    let timer;
+    try {
+        await Promise.race([
+            driver.quit(),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`quit timed out after ${DRIVER_QUIT_TIMEOUT_MS}ms`)), DRIVER_QUIT_TIMEOUT_MS);
+            })
+        ]);
+        return 'quit';
+    } catch (e) {
+        metrics.forcedQuits++;
+        console.error(`[FORCE-QUIT] key=${key} reason=${reason}: ${e.message}`);
+        if (meta?.userDataDir) {
+            try {
+                execFileSync('pkill', ['-9', '-f', '--', meta.userDataDir], { stdio: 'ignore' });
+            } catch { /* pkill exits 1 when nothing matched — fine */ }
+        }
+        return 'killed';
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// External state file path (mounted volume at /data)
+const EXTERNAL_STATE_FILE = '/data/mcp-state.json';
+const FEEDBACK_LOG_FILE = '/data/agent-feedback.jsonl';
+
+// Default state (fallback if no external file)
+const DEFAULT_MCP_STATE = {
+    knownIssues: [
+        {
+            id: 'firefox-zombie',
+            browser: 'firefox',
+            severity: 'high',
+            description: 'Firefox becomes zombie process after navigation in container environments',
+            workaround: 'Use host.docker.internal instead of localhost/127.0.0.1',
+            active: true
+        },
+        {
+            id: 'chrome-localhost-bypass',
+            browser: 'chrome',
+            severity: 'blocker',
+            description: 'Chrome hardcodes localhost/127.0.0.1 proxy bypass - cannot be overridden',
+            workaround: 'Use host.docker.internal:PORT instead of localhost:PORT',
+            active: true
+        }
+    ],
+    workingPatterns: [
+        {
+            pattern: 'host-access',
+            description: 'Access host machine services from container',
+            recommended: 'http://host.docker.internal:PORT',
+            avoid: ['http://localhost:PORT', 'http://127.0.0.1:PORT'],
+            reason: 'Browsers bypass proxy for loopback addresses'
+        }
+    ],
+    notes: []
+};
+
+// Read external state file (or return defaults)
+function readExternalState() {
+    try {
+        if (fs.existsSync(EXTERNAL_STATE_FILE)) {
+            const content = fs.readFileSync(EXTERNAL_STATE_FILE, 'utf8');
+            const parsed = JSON.parse(content);
+            debugLog(`Loaded external state from ${EXTERNAL_STATE_FILE}`);
+            return { ...DEFAULT_MCP_STATE, ...parsed };
+        }
+    } catch (e) {
+        debugLog(`Error reading external state: ${e.message}`);
+    }
+    return DEFAULT_MCP_STATE;
+}
+
+// Write to external state file (for error recording)
+function writeExternalState(newState) {
+    try {
+        fs.writeFileSync(EXTERNAL_STATE_FILE, JSON.stringify(newState, null, 2));
+        debugLog(`Wrote external state to ${EXTERNAL_STATE_FILE}`);
+    } catch (e) {
+        debugLog(`Error writing external state: ${e.message}`);
+    }
+}
+
+// Chrome crash error signatures — these mean the browser process/tab is dead,
+// not just a transient network or selector error.
+const CHROME_CRASH_PATTERNS = /tab crashed|no such session|session deleted|chrome not reachable|no such window|target window already closed|session not created|cannot determine loading status/i;
+
+// Tracks when each driver last ran a successful tool call (used by idle health check)
+const lastToolSuccessAt = new Map();
+
+// Mark a driver session as healthy after a successful tool call
+function recordSuccess(key) {
+    if (!key) return;
+    lastToolSuccessAt.set(key, Date.now());
+    const h = state.driverHealth.get(key);
+    if (h && !h.healthy) {
+        state.driverHealth.set(key, { healthy: true, failCount: 0, checkedAt: Date.now() });
+    }
+}
+
+// Helper to record errors for cross-session visibility
+function recordError(context, error) {
+    const errorEntry = {
+        timestamp: new Date().toISOString(),
+        context,
+        message: error.message || String(error)
+    };
+
+    // Update in-memory state
+    state.recentErrors.unshift(errorEntry);
+    if (state.recentErrors.length > 10) {
+        state.recentErrors.pop();
+    }
+
+    // Also persist to external file
+    try {
+        const externalState = readExternalState();
+        externalState.recentErrors = externalState.recentErrors || [];
+        externalState.recentErrors.unshift(errorEntry);
+        if (externalState.recentErrors.length > 10) {
+            externalState.recentErrors.pop();
+        }
+        externalState.lastErrorUpdate = new Date().toISOString();
+        writeExternalState(externalState);
+    } catch (e) {
+        debugLog(`Failed to persist error to external state: ${e.message}`);
+    }
+
+    // Reactive Chrome crash detection — update driverHealth immediately when a
+    // tool call returns a crash-signature error. No polling needed; no false positives.
+    if (CHROME_CRASH_PATTERNS.test(errorEntry.message)) {
+        const key = getMcpSessionId() || state.currentSession;
+        if (key && state.drivers.has(key)) {
+            const prev = state.driverHealth.get(key) || { failCount: 0 };
+            const failCount = prev.failCount + 1;
+            state.driverHealth.set(key, { healthy: false, failCount, checkedAt: Date.now(), error: errorEntry.message });
+            console.error(`Chrome crash detected for session ${key} (fail #${failCount}): ${errorEntry.message}`);
+        }
+    }
+}
+
+// Helper: get the MCP session ID from AsyncLocalStorage (HTTP mode) or fall back to global (STDIO)
+const getMcpSessionId = () => {
+    const store = mcpSessionContext.getStore();
+    return store?.mcpSessionId || null;
+};
+
+// Helper: get the driver key for the current caller
+const getDriverKey = () => {
+    return getMcpSessionId() || state.currentSession;
 };
 
 // Helper functions
 const getDriver = () => {
-    const driver = state.drivers.get(state.currentSession);
+    const key = getDriverKey();
+    const driver = key ? state.drivers.get(key) : null;
     if (!driver) {
         throw new Error('No active browser session');
     }
@@ -43,6 +264,36 @@ const getLocator = (by, value) => {
     }
 };
 
+// Shadow DOM piercing helper - finds element by recursively searching through shadow roots
+const findElementPiercingShadow = async (driver, selector, timeout = 10000) => {
+    const script = `
+        function querySelectorDeep(selector, root = document) {
+            // Try to find in current context first
+            let element = root.querySelector(selector);
+            if (element) return element;
+
+            // Search through all shadow roots
+            const allElements = root.querySelectorAll('*');
+            for (const el of allElements) {
+                if (el.shadowRoot) {
+                    element = querySelectorDeep(selector, el.shadowRoot);
+                    if (element) return element;
+                }
+            }
+            return null;
+        }
+        return querySelectorDeep(arguments[0]);
+    `;
+
+    const endTime = Date.now() + timeout;
+    while (Date.now() < endTime) {
+        const element = await driver.executeScript(script, selector);
+        if (element) return element;
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error(`Element not found with shadow piercing: ${selector}`);
+};
+
 // Common schemas
 const browserOptionsSchema = z.object({
     headless: z.boolean().optional().describe("Run browser in headless mode"),
@@ -52,8 +303,20 @@ const browserOptionsSchema = z.object({
 const locatorSchema = {
     by: z.enum(["id", "css", "xpath", "name", "tag", "class"]).describe("Locator strategy to find element"),
     value: z.string().describe("Value for the locator strategy"),
-    timeout: z.number().optional().describe("Maximum time to wait for element in milliseconds")
+    timeout: z.number().optional().describe("Maximum time to wait for element in milliseconds"),
+    pierce_shadow: z.boolean().optional().describe("If true, searches through Shadow DOM boundaries. Only works with CSS selectors.")
 };
+
+// Creates a brand-new McpServer with every tool registered on it. Called once per
+// HTTP session (see the /mcp route) and once for the single STDIO session, so that
+// no two sessions ever share a server whose Protocol.connect() would silently
+// overwrite the other's transport (see node_modules/@modelcontextprotocol/sdk
+// dist/esm/shared/protocol.js — connect() replaces this._transport wholesale).
+function createMcpServer() {
+    const server = new McpServer({
+        name: "MCP Selenium",
+        version: "1.0.0"
+    });
 
 // Browser Management Tools
 server.tool(
@@ -64,22 +327,266 @@ server.tool(
         options: browserOptionsSchema
     },
     async ({ browser, options = {} }) => {
+        // Direct file write test (bypassing debugLog)
         try {
+            fs.appendFileSync('/tmp/start_browser_called.txt', `Called at ${new Date().toISOString()} with browser=${browser}\n`);
+        } catch (writeErr) {
+            fs.appendFileSync('/tmp/write_error.txt', `Write error: ${writeErr.message}\n`);
+        }
+        debugLog(`=== start_browser called: browser=${browser}, options=${JSON.stringify(options)} ===`);
+        try {
+            const mcpSession = getMcpSessionId();
+
+            if (mcpSession) {
+                // HTTP mode: only clean up THIS session's browser
+                if (state.drivers.has(mcpSession)) {
+                    debugLog(`Cleaning up existing browser for MCP session ${mcpSession}`);
+                    await forceQuitDriver(mcpSession, 'start_browser-replace');
+                }
+            } else {
+                // STDIO mode: clean up all sessions (only one expected)
+                await Promise.all([...state.drivers.keys()].map((k) => forceQuitDriver(k, 'start_browser-replace')));
+                state.currentSession = null;
+
+                // Kill any orphaned browser processes (only safe in single-session mode)
+                try {
+                    const { execSync } = await import('child_process');
+                    execSync('pkill -9 chromium || true', { stdio: 'ignore' });
+                    execSync('pkill -9 chrome || true', { stdio: 'ignore' });
+                    execSync('rm -rf /tmp/chrome-* /tmp/.org.chromium.* || true', { stdio: 'ignore' });
+                } catch (e) { /* ignore cleanup errors */ }
+            }
+
+            const remoteUrl = process.env.SELENIUM_REMOTE_URL || null;
             let builder = new Builder();
+            if (remoteUrl) {
+                builder = builder.usingServer(remoteUrl);
+                debugLog(`Using remote Selenium Grid: ${remoteUrl}`);
+            }
             let driver;
+
+            // Generate unique temp dir for this session
+            const sessionTempDir = `/tmp/chrome-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+            // Auto-detect if we need headless mode (no DISPLAY = container/headless environment)
+            const hasDisplay = !!process.env.DISPLAY || !!remoteUrl;
+            const forceHeadless = !hasDisplay && options.headless === false;
+            const useHeadless = options.headless === true || !hasDisplay;
+
+            if (forceHeadless) {
+                console.error('Warning: headless=false requested but no DISPLAY available. Forcing headless mode.');
+            }
+
             switch (browser) {
                 case 'chrome': {
                     const chromeOptions = new ChromeOptions();
-                    if (options.headless) {
+                    // Support base image (Chromium) and VNC image (Google Chrome)
+                    if (process.env.CHROME_BIN) {
+                        chromeOptions.setChromeBinaryPath(process.env.CHROME_BIN);
+                    }
+                    if (useHeadless) {
                         chromeOptions.addArguments('--headless=new');
                     }
-                    if (options.arguments) {
-                        options.arguments.forEach(arg => chromeOptions.addArguments(arg));
+                    // Use unique user-data-dir for this session
+                    chromeOptions.addArguments(`--user-data-dir=${sessionTempDir}`);
+                    // Container-friendly Chrome arguments
+                    chromeOptions.addArguments('--disable-dev-shm-usage');
+                    chromeOptions.addArguments('--no-sandbox');
+                    // Memory containment — prevents OOM in long-running container sessions
+                    chromeOptions.addArguments('--renderer-process-limit=2');
+                    chromeOptions.addArguments('--disable-extensions');
+                    chromeOptions.addArguments('--disable-default-apps');
+                    chromeOptions.addArguments('--disk-cache-size=67108864');   // 64MB
+                    chromeOptions.addArguments('--media-cache-size=8388608');   // 8MB
+                    chromeOptions.addArguments('--js-flags=--max-old-space-size=1024');
+
+                    // Stealth/Anti-detection arguments
+                    chromeOptions.addArguments('--disable-blink-features=AutomationControlled');
+                    chromeOptions.addArguments('--disable-infobars');
+                    chromeOptions.addArguments('--window-size=1920,1080');
+                    chromeOptions.addArguments('--start-maximized');
+
+                    // Headed host-mimicking mode: a real X display is present (Xvfb),
+                    // so match the host's devicePixelRatio and route WebGL/Vulkan
+                    // through ANGLE so it renders on the real GPU instead of falling
+                    // back to software (llvmpipe/SwiftShader). Only applies when
+                    // actually running headed against a local DISPLAY — not for
+                    // remote-Grid sessions, which have no local GPU to hand off to.
+                    if (process.env.DISPLAY && !useHeadless) {
+                        chromeOptions.addArguments('--force-device-scale-factor=2');
+                        chromeOptions.addArguments('--lang=en-US');
+                        // ANGLE-over-native-GL on the Mesa d3d12 Gallium driver is the
+                        // path that reaches the real GPU headed (Vulkan/dzn enumerates
+                        // the card but can't drive ANGLE rendering — measured). The
+                        // MESA_* / GALLIUM_DRIVER env in the image select d3d12 + the
+                        // NVIDIA adapter over the AMD iGPU.
+                        chromeOptions.addArguments('--ignore-gpu-blocklist');
+                        chromeOptions.addArguments('--use-gl=angle');
+                        chromeOptions.addArguments('--use-angle=gl');
                     }
-                    driver = await builder
-                        .forBrowser('chrome')
-                        .setChromeOptions(chromeOptions)
-                        .build();
+
+                    // Exclude automation switches
+                    chromeOptions.excludeSwitches('enable-automation');
+                    chromeOptions.setUserPreferences({
+                        'credentials_enable_service': false,
+                        'profile.password_manager_enabled': false
+                    });
+
+                    if (options.arguments) {
+                        // Filter out user-data-dir to avoid conflicts
+                        options.arguments
+                            .filter(arg => !arg.includes('user-data-dir'))
+                            .forEach(arg => chromeOptions.addArguments(arg));
+                    }
+
+                    // Configure proxy if HTTP_PROXY is set
+                    const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+                    if (proxyUrl) {
+                        const proxyMatch = proxyUrl.match(/https?:\/\/([^:\/]+):?(\d+)?/);
+                        if (proxyMatch) {
+                            const proxyHost = proxyMatch[1];
+                            const proxyPort = proxyMatch[2] || '3128';
+
+                            // Resolve hostname to IP since Chrome bypasses container DNS
+                            let proxyIp = proxyHost;
+                            try {
+                                const { lookup } = await import('dns/promises');
+                                const result = await lookup(proxyHost);
+                                proxyIp = result.address;
+                                console.error(`✓ Resolved proxy ${proxyHost} to ${proxyIp}`);
+                            } catch (e) {
+                                console.error(`DNS lookup failed for ${proxyHost}, using as-is`);
+                            }
+
+                            chromeOptions.addArguments(`--proxy-server=${proxyIp}:${proxyPort}`);
+                            // Block Google service requests to prevent hangs when behind proxy
+                            chromeOptions.addArguments('--host-resolver-rules=MAP *.googleapis.com 127.0.0.1, MAP *.google.com 127.0.0.1, MAP *.gstatic.com 127.0.0.1');
+                            chromeOptions.addArguments('--disable-background-networking');
+                            chromeOptions.addArguments('--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction');
+                            console.error(`✓ Configured Chrome to use proxy: ${proxyIp}:${proxyPort}`);
+                        }
+                    }
+
+                    const buildTimeout = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Chrome browser start timed out after 30s — Selenium Grid may not be ready')), 30000)
+                    );
+                    driver = await Promise.race([
+                        builder.forBrowser('chrome').setChromeOptions(chromeOptions).build(),
+                        buildTimeout
+                    ]);
+
+                    // Headed: --window-size is in DIPs, so with a forced scale factor the window can
+                    // come out larger than the X screen and hang off its top-left (unusable in noVNC,
+                    // and outerWidth > screen.width is a bot tell). Clamp it to the screen.
+                    if (process.env.DISPLAY && !useHeadless) {
+                        try {
+                            const s = await driver.executeScript('return [screen.availWidth, screen.availHeight]');
+                            const r = await driver.manage().window().getRect();
+                            if (r.x < 0 || r.y < 0 || r.x + r.width > s[0] || r.y + r.height > s[1]) {
+                                await driver.manage().window().setRect({ x: 0, y: 0, width: s[0], height: s[1] });
+                                console.error(`Window ${r.width}x${r.height}@${r.x},${r.y} exceeded screen ${s[0]}x${s[1]}; resized to fit`);
+                            }
+                        } catch (e) {
+                            console.error(`Window fit check failed: ${e.message}`);
+                        }
+                    }
+
+                    // Comprehensive stealth JavaScript (mimics puppeteer-extra-plugin-stealth)
+                    // Use CDP to inject BEFORE page scripts execute
+                    const stealthScript = `
+                        // 1. Remove navigator.webdriver
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        delete Object.getPrototypeOf(navigator).webdriver;
+
+                        // 2. Mock chrome object
+                        if (!window.chrome) {
+                            Object.defineProperty(window, 'chrome', {
+                                writable: true,
+                                enumerable: true,
+                                configurable: false,
+                                value: {}
+                            });
+                        }
+
+                        // 3. chrome.app mock
+                        window.chrome.app = {
+                            isInstalled: false,
+                            InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                            RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+                            getDetails: function() { return null; },
+                            getIsInstalled: function() { return false; },
+                            runningState: function() { return 'cannot_run'; }
+                        };
+
+                        // 4. chrome.csi mock
+                        window.chrome.csi = function() {
+                            return {
+                                onloadT: Date.now(),
+                                startE: Date.now() - Math.floor(Math.random() * 1000),
+                                pageT: Math.floor(Math.random() * 1000),
+                                tran: 15
+                            };
+                        };
+
+                        // 5. chrome.loadTimes mock
+                        window.chrome.loadTimes = function() {
+                            return {
+                                commitLoadTime: Date.now() / 1000,
+                                connectionInfo: 'h2',
+                                finishDocumentLoadTime: Date.now() / 1000,
+                                finishLoadTime: Date.now() / 1000,
+                                firstPaintAfterLoadTime: 0,
+                                firstPaintTime: Date.now() / 1000,
+                                navigationType: 'Other',
+                                npnNegotiatedProtocol: 'h2',
+                                requestTime: Date.now() / 1000 - 0.1,
+                                startLoadTime: Date.now() / 1000 - 0.1,
+                                wasAlternateProtocolAvailable: false,
+                                wasFetchedViaSpdy: true,
+                                wasNpnNegotiated: true
+                            };
+                        };
+
+                        // 6. Mock navigator.languages
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+                        // 7. Permissions API mock (for notifications)
+                        const originalQuery = window.navigator.permissions.query;
+                        window.navigator.permissions.query = function(parameters) {
+                            if (parameters.name === 'notifications') {
+                                return Promise.resolve({ state: Notification.permission });
+                            }
+                            return originalQuery.apply(this, arguments);
+                        };
+
+                        // 8. Mock hardware concurrency (typical desktop value)
+                        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+
+                        // 9. Mock deviceMemory (typical desktop value)
+                        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+
+                        // 10. Spoof screen dimensions
+                        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+                        Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+                        Object.defineProperty(screen, 'width', { get: () => 1920 });
+                        Object.defineProperty(screen, 'height', { get: () => 1080 });
+                        Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+                        Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
+
+                        // 11. Window outer dimensions
+                        Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
+                        Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+                    `;
+
+                    // Inject via CDP for pre-page-load execution (10s timeout — non-fatal if it hangs)
+                    try {
+                        await Promise.race([
+                            driver.sendDevToolsCommand('Page.addScriptToEvaluateOnNewDocument', { source: stealthScript }),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error('CDP stealth injection timed out')), 10000))
+                        ]);
+                    } catch (cdpErr) {
+                        console.error('CDP stealth injection failed (skipping):', cdpErr.message);
+                    }
                     break;
                 }
                 case 'edge': {
@@ -97,31 +604,126 @@ server.tool(
                     break;
                 }
                 case 'firefox': {
+                    debugLog('=== Starting Firefox browser setup ===');
                     const firefoxOptions = new FirefoxOptions();
-                    if (options.headless) {
-                        firefoxOptions.addArguments('--headless');
+                    if (useHeadless) {
+                        firefoxOptions.addArguments('-headless');
+                        debugLog('Headless mode enabled');
                     }
+
+                    // Disable sandbox for container environments
+                    firefoxOptions.setPreference('security.sandbox.content.level', 0);
+                    firefoxOptions.setPreference('security.sandbox.gpu.level', 0);
+                    // Disable various Firefox features that cause issues in containers
+                    firefoxOptions.setPreference('browser.tabs.remote.autostart', false);
+                    firefoxOptions.setPreference('browser.tabs.remote.autostart.2', false);
+                    firefoxOptions.setPreference('dom.ipc.processCount', 1);
+                    firefoxOptions.setPreference('toolkit.cosmeticAnimations.enabled', false);
+                    firefoxOptions.setPreference('media.hardware-video-decoding.enabled', false);
+                    // Disable crash reporter and telemetry
+                    firefoxOptions.setPreference('toolkit.telemetry.reportingpolicy.firstRun', false);
+                    firefoxOptions.setPreference('datareporting.policy.dataSubmissionEnabled', false);
+                    firefoxOptions.setPreference('browser.crashReports.unsubmittedCheck.enabled', false);
+                    debugLog('Sandbox and container-incompatible features disabled');
+
+                    // Allow Firefox to bypass proxy for localhost (socat will handle forwarding)
+                    // This lets Firefox connect directly to localhost:8000 where socat forwards to host
+                    firefoxOptions.setPreference('network.proxy.no_proxies_on', 'localhost, 127.0.0.1');
+                    debugLog('Localhost proxy bypass enabled (socat handles forwarding)');
+
                     if (options.arguments) {
                         options.arguments.forEach(arg => firefoxOptions.addArguments(arg));
                     }
+
+                    // Configure proxy if HTTP_PROXY is set
+                    const firefoxProxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+                    debugLog(`HTTP_PROXY env: ${firefoxProxyUrl}`);
+                    if (firefoxProxyUrl) {
+                        const firefoxProxyMatch = firefoxProxyUrl.match(/https?:\/\/([^:\/]+):?(\d+)?/);
+                        debugLog(`Proxy regex match: ${JSON.stringify(firefoxProxyMatch)}`);
+                        if (firefoxProxyMatch) {
+                            const proxyHost = firefoxProxyMatch[1];
+                            const proxyPort = firefoxProxyMatch[2] || '3128';
+
+                            // Resolve hostname to IP
+                            let proxyIp = proxyHost;
+                            try {
+                                const { lookup } = await import('dns/promises');
+                                const result = await lookup(proxyHost);
+                                proxyIp = result.address;
+                                debugLog(`Resolved proxy ${proxyHost} to ${proxyIp}`);
+                            } catch (e) {
+                                debugLog(`DNS lookup failed for ${proxyHost}: ${e.message}, using hostname`);
+                            }
+
+                            // Set manual proxy configuration (type 1)
+                            firefoxOptions.setPreference('network.proxy.type', 1);
+                            firefoxOptions.setPreference('network.proxy.http', proxyIp);
+                            firefoxOptions.setPreference('network.proxy.http_port', parseInt(proxyPort));
+                            firefoxOptions.setPreference('network.proxy.ssl', proxyIp);
+                            firefoxOptions.setPreference('network.proxy.ssl_port', parseInt(proxyPort));
+                            // IMPORTANT: Preserve localhost bypass for socat forwarding (OAuth callbacks)
+                            // Do NOT set to '' - that breaks localhost:8000 access
+                            firefoxOptions.setPreference('network.proxy.no_proxies_on', 'localhost, 127.0.0.1');
+
+                            debugLog(`Configured Firefox manual proxy: ${proxyIp}:${proxyPort}`);
+                        }
+                    } else {
+                        debugLog('No HTTP_PROXY env var found');
+                    }
+
+                    // Set Firefox binary path explicitly to avoid selenium-manager network calls
+                    const firefoxBin = process.env.FIREFOX_BIN || '/root/.cache/selenium/firefox/linux64/147.0.2/firefox';
+                    firefoxOptions.setBinary(firefoxBin);
+                    debugLog(`Firefox binary: ${firefoxBin}`);
+
+                    // Set geckodriver path
+                    const geckodriverPath = process.env.GECKODRIVER_PATH || '/root/.cache/selenium/geckodriver/linux64/0.36.0/geckodriver';
+                    debugLog(`Geckodriver: ${geckodriverPath}`);
+
+                    const { ServiceBuilder } = await import('selenium-webdriver/firefox.js');
+                    const firefoxService = new ServiceBuilder(geckodriverPath);
+
                     driver = await builder
                         .forBrowser('firefox')
                         .setFirefoxOptions(firefoxOptions)
+                        .setFirefoxService(firefoxService)
                         .build();
+                    debugLog('Firefox driver built successfully');
                     break;
                 }
                 default: {
                     throw new Error(`Unsupported browser: ${browser}`);
                 }
             }
-            const sessionId = `${browser}_${Date.now()}`;
-            state.drivers.set(sessionId, driver);
-            state.currentSession = sessionId;
+            // Set page load timeout so navigate fails fast instead of hanging (default is 300s)
+            await driver.manage().setTimeouts({ pageLoad: 30000 });
 
+            // Use MCP session ID as driver key (HTTP mode) or generate one (STDIO mode)
+            const driverKey = mcpSession || `${browser}_${Date.now()}`;
+            state.drivers.set(driverKey, driver);
+            // Record this browser's unique profile dir so forceQuitDriver can kill
+            // exactly its processes if it wedges (chrome/msedge report userDataDir;
+            // firefox reports moz:profile).
+            try {
+                const caps = await driver.getCapabilities();
+                const userDataDir = caps.get('chrome')?.userDataDir
+                    || caps.get('msedge')?.userDataDir
+                    || caps.get('moz:profile');
+                state.driverMeta.set(driverKey, { userDataDir });
+            } catch { /* metadata is best-effort; quit still has the timeout */ }
+            if (!mcpSession) {
+                state.currentSession = driverKey;
+            }
+
+            const containerId = os.hostname();
+            const activeBrowsers = state.drivers.size;
+            debugLog(`Browser started: key=${driverKey}, active_browsers=${activeBrowsers}`);
             return {
-                content: [{ type: 'text', text: `Browser started with session_id: ${sessionId}` }]
+                content: [{ type: 'text', text: `Browser started with session_id: ${driverKey}\nContainer: ${containerId}\nActive browsers: ${activeBrowsers}` }]
             };
         } catch (e) {
+            recordError('start_browser', e);
             return {
                 content: [{ type: 'text', text: `Error starting browser: ${e.message}` }]
             };
@@ -138,11 +740,24 @@ server.tool(
     async ({ url }) => {
         try {
             const driver = getDriver();
-            await driver.get(url);
+
+            // Check for localhost URLs and warn about known issues
+            if (url.includes('localhost') || url.includes('127.0.0.1')) {
+                const warning = `WARNING: Navigating to ${url} - browsers may bypass proxy for localhost. Consider using host.docker.internal instead.`;
+                debugLog(warning);
+                recordError('navigate-localhost-warning', { message: warning });
+            }
+
+            await Promise.race([
+                driver.get(url),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('navigate timed out after 35s')), 35000))
+            ]);
+            recordSuccess(getDriverKey());
             return {
                 content: [{ type: 'text', text: `Navigated to ${url}` }]
             };
         } catch (e) {
+            recordError(`navigate:${url}`, e);
             return {
                 content: [{ type: 'text', text: `Error navigating: ${e.message}` }]
             };
@@ -157,11 +772,15 @@ server.tool(
     {
         ...locatorSchema
     },
-    async ({ by, value, timeout = 10000 }) => {
+    async ({ by, value, timeout = 10000, pierce_shadow = false }) => {
         try {
             const driver = getDriver();
-            const locator = getLocator(by, value);
-            await driver.wait(until.elementLocated(locator), timeout);
+            if (pierce_shadow && by === 'css') {
+                await findElementPiercingShadow(driver, value, timeout);
+            } else {
+                const locator = getLocator(by, value);
+                await driver.wait(until.elementLocated(locator), timeout);
+            }
             return {
                 content: [{ type: 'text', text: 'Element found' }]
             };
@@ -175,19 +794,57 @@ server.tool(
 
 server.tool(
     "click_element",
-    "clicks an element",
+    "clicks an element. Use force=true to bypass 'element not interactable' errors by using Actions API or JavaScript fallback.",
     {
-        ...locatorSchema
+        ...locatorSchema,
+        force: z.boolean().optional().describe("If true, uses Actions API move+click or JS click as fallback when element is not interactable"),
+        scroll_into_view: z.boolean().optional().describe("If true, scrolls element into view before clicking")
     },
-    async ({ by, value, timeout = 10000 }) => {
+    async ({ by, value, timeout = 10000, pierce_shadow = false, force = false, scroll_into_view = false }) => {
         try {
             const driver = getDriver();
-            const locator = getLocator(by, value);
-            const element = await driver.wait(until.elementLocated(locator), timeout);
-            await element.click();
-            return {
-                content: [{ type: 'text', text: 'Element clicked' }]
-            };
+            let element;
+            if (pierce_shadow && by === 'css') {
+                element = await findElementPiercingShadow(driver, value, timeout);
+            } else {
+                const locator = getLocator(by, value);
+                element = await driver.wait(until.elementLocated(locator), timeout);
+            }
+
+            // Optionally scroll into view first
+            if (scroll_into_view) {
+                await driver.executeScript("arguments[0].scrollIntoView({block: 'center', behavior: 'instant'});", element);
+                await new Promise(resolve => setTimeout(resolve, 100)); // Brief pause for scroll
+            }
+
+            // Try normal click first
+            try {
+                await element.click();
+                return {
+                    content: [{ type: 'text', text: 'Element clicked' }]
+                };
+            } catch (clickErr) {
+                if (!force) {
+                    throw clickErr;
+                }
+
+                // Force mode: try Actions API
+                debugLog(`Normal click failed (${clickErr.message}), trying Actions API...`);
+                try {
+                    const actions = driver.actions({ bridge: true });
+                    await actions.move({ origin: element }).click().perform();
+                    return {
+                        content: [{ type: 'text', text: 'Element clicked (via Actions API)' }]
+                    };
+                } catch (actionsErr) {
+                    // Last resort: JavaScript click
+                    debugLog(`Actions API click failed (${actionsErr.message}), trying JS click...`);
+                    await driver.executeScript("arguments[0].click();", element);
+                    return {
+                        content: [{ type: 'text', text: 'Element clicked (via JavaScript)' }]
+                    };
+                }
+            }
         } catch (e) {
             return {
                 content: [{ type: 'text', text: `Error clicking element: ${e.message}` }]
@@ -203,11 +860,16 @@ server.tool(
         ...locatorSchema,
         text: z.string().describe("Text to enter into the element")
     },
-    async ({ by, value, text, timeout = 10000 }) => {
+    async ({ by, value, text, timeout = 10000, pierce_shadow = false }) => {
         try {
             const driver = getDriver();
-            const locator = getLocator(by, value);
-            const element = await driver.wait(until.elementLocated(locator), timeout);
+            let element;
+            if (pierce_shadow && by === 'css') {
+                element = await findElementPiercingShadow(driver, value, timeout);
+            } else {
+                const locator = getLocator(by, value);
+                element = await driver.wait(until.elementLocated(locator), timeout);
+            }
             await element.clear();
             await element.sendKeys(text);
             return {
@@ -227,11 +889,16 @@ server.tool(
     {
         ...locatorSchema
     },
-    async ({ by, value, timeout = 10000 }) => {
+    async ({ by, value, timeout = 10000, pierce_shadow = false }) => {
         try {
             const driver = getDriver();
-            const locator = getLocator(by, value);
-            const element = await driver.wait(until.elementLocated(locator), timeout);
+            let element;
+            if (pierce_shadow && by === 'css') {
+                element = await findElementPiercingShadow(driver, value, timeout);
+            } else {
+                const locator = getLocator(by, value);
+                element = await driver.wait(until.elementLocated(locator), timeout);
+            }
             const text = await element.getText();
             return {
                 content: [{ type: 'text', text }]
@@ -345,22 +1012,125 @@ server.tool(
 );
 
 server.tool(
-    "press_key",
-    "simulates pressing a keyboard key",
+    "click_at_coordinates",
+    "clicks at specific x,y coordinates on the page using Actions API. Useful when element selectors fail.",
     {
-        key: z.string().describe("Key to press (e.g., 'Enter', 'Tab', 'a', etc.)")
+        x: z.coerce.number().describe("X coordinate (pixels from left edge of viewport)"),
+        y: z.coerce.number().describe("Y coordinate (pixels from top edge of viewport)")
+    },
+    async ({ x, y }) => {
+        try {
+            const driver = getDriver();
+            const actions = driver.actions({ bridge: true });
+            // Move to coordinates relative to viewport and click
+            await actions.move({ x: Math.round(x), y: Math.round(y), origin: 'viewport' }).click().perform();
+            return {
+                content: [{ type: 'text', text: `Clicked at coordinates (${x}, ${y})` }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error clicking at coordinates: ${e.message}` }]
+            };
+        }
+    }
+);
+
+// Map common key names to Selenium Key constants
+const getKeyConstant = (keyName) => {
+    const keyMap = {
+        'enter': Key.ENTER,
+        'return': Key.RETURN,
+        'tab': Key.TAB,
+        'escape': Key.ESCAPE,
+        'esc': Key.ESCAPE,
+        'backspace': Key.BACK_SPACE,
+        'delete': Key.DELETE,
+        'space': Key.SPACE,
+        'up': Key.UP,
+        'down': Key.DOWN,
+        'left': Key.LEFT,
+        'right': Key.RIGHT,
+        'home': Key.HOME,
+        'end': Key.END,
+        'pageup': Key.PAGE_UP,
+        'pagedown': Key.PAGE_DOWN,
+        'shift': Key.SHIFT,
+        'control': Key.CONTROL,
+        'ctrl': Key.CONTROL,
+        'alt': Key.ALT,
+        'meta': Key.META,
+        'command': Key.COMMAND,
+        'f1': Key.F1,
+        'f2': Key.F2,
+        'f3': Key.F3,
+        'f4': Key.F4,
+        'f5': Key.F5,
+        'f6': Key.F6,
+        'f7': Key.F7,
+        'f8': Key.F8,
+        'f9': Key.F9,
+        'f10': Key.F10,
+        'f11': Key.F11,
+        'f12': Key.F12,
+    };
+    const normalizedKey = keyName.toLowerCase().trim();
+    return keyMap[normalizedKey] || keyName;
+};
+
+server.tool(
+    "press_key",
+    "simulates pressing a keyboard key. Supports special keys: Enter, Tab, Escape, Backspace, Delete, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, Shift, Control/Ctrl, Alt, Meta/Command, F1-F12",
+    {
+        key: z.string().describe("Key to press (e.g., 'Enter', 'Tab', 'Escape', 'a', 'Ctrl', etc.)")
     },
     async ({ key }) => {
         try {
             const driver = getDriver();
             const actions = driver.actions({ bridge: true });
-            await actions.keyDown(key).keyUp(key).perform();
+            const resolvedKey = getKeyConstant(key);
+            await actions.keyDown(resolvedKey).keyUp(resolvedKey).perform();
             return {
                 content: [{ type: 'text', text: `Key '${key}' pressed` }]
             };
         } catch (e) {
             return {
                 content: [{ type: 'text', text: `Error pressing key: ${e.message}` }]
+            };
+        }
+    }
+);
+
+server.tool(
+    "type_keys",
+    "Types text and/or special keys to the currently focused element using Actions API. Use {Enter}, {Tab}, etc. for special keys within the text. More reliable than send_keys for complex inputs.",
+    {
+        text: z.string().describe("Text to type. Embed special keys using {KeyName} syntax, e.g., 'Hello{Enter}' or 'user{Tab}password{Enter}'")
+    },
+    async ({ text }) => {
+        try {
+            const driver = getDriver();
+            const actions = driver.actions({ bridge: true });
+
+            // Parse text for {SpecialKey} patterns and build action sequence
+            const parts = text.split(/(\{[^}]+\})/);
+            for (const part of parts) {
+                if (part.startsWith('{') && part.endsWith('}')) {
+                    // Special key
+                    const keyName = part.slice(1, -1);
+                    const resolvedKey = getKeyConstant(keyName);
+                    actions.keyDown(resolvedKey).keyUp(resolvedKey);
+                } else if (part.length > 0) {
+                    // Regular text
+                    actions.sendKeys(part);
+                }
+            }
+            await actions.perform();
+            return {
+                content: [{ type: 'text', text: `Typed: ${text}` }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error typing keys: ${e.message}` }]
             };
         }
     }
@@ -390,33 +1160,531 @@ server.tool(
     }
 );
 
+// Frame handling tools
 server.tool(
-    "take_screenshot",
-    "captures a screenshot of the current page",
+    "switch_to_frame",
+    "switches context to an iframe. Use index (0-based) or locator (css/xpath) to identify the frame",
     {
-        outputPath: z.string().optional().describe("Optional path where to save the screenshot. If not provided, returns base64 data.")
+        by: z.enum(["index", "css", "xpath"]).describe("How to locate the frame: 'index' for frame number, or 'css'/'xpath' for selector"),
+        value: z.string().describe("Frame index (e.g. '0') or CSS/XPath selector (e.g. 'iframe#chat-widget')")
     },
-    async ({ outputPath }) => {
+    async ({ by, value }) => {
         try {
             const driver = getDriver();
-            const screenshot = await driver.takeScreenshot();
-            if (outputPath) {
-                const fs = await import('fs');
-                await fs.promises.writeFile(outputPath, screenshot, 'base64');
+            if (by === "index") {
+                const index = parseInt(value, 10);
+                await driver.switchTo().frame(index);
                 return {
-                    content: [{ type: 'text', text: `Screenshot saved to ${outputPath}` }]
+                    content: [{ type: 'text', text: `Switched to frame at index ${index}` }]
                 };
             } else {
+                const locator = getLocator(by, value);
+                const frameElement = await driver.findElement(locator);
+                await driver.switchTo().frame(frameElement);
                 return {
-                    content: [
-                        { type: 'text', text: 'Screenshot captured as base64:' },
-                        { type: 'text', text: screenshot }
-                    ]
+                    content: [{ type: 'text', text: `Switched to frame: ${value}` }]
                 };
             }
         } catch (e) {
             return {
+                content: [{ type: 'text', text: `Error switching to frame: ${e.message}` }]
+            };
+        }
+    }
+);
+
+server.tool(
+    "switch_to_default_content",
+    "switches back to the main page context from an iframe",
+    {},
+    async () => {
+        try {
+            const driver = getDriver();
+            await driver.switchTo().defaultContent();
+            return {
+                content: [{ type: 'text', text: 'Switched back to main page context' }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error switching to default content: ${e.message}` }]
+            };
+        }
+    }
+);
+
+server.tool(
+    "execute_script",
+    "SECURITY WARNING: Executes arbitrary JavaScript in the browser context. This is a powerful tool that can access cookies, session data, and perform any action the page can. Use pierce_shadow option on other tools instead when possible. Only use this for advanced cases like custom scrolling or accessing data not available through other tools.",
+    {
+        script: z.string().describe("JavaScript code to execute. Use 'return' to get a value back. Use 'arguments[0]', 'arguments[1]', etc. to access args."),
+        args: z.array(z.any()).optional().describe("Optional array of arguments to pass to the script")
+    },
+    async ({ script, args = [] }) => {
+        try {
+            const driver = getDriver();
+            const result = await driver.executeScript(script, ...args);
+            return {
+                content: [{ type: 'text', text: `Script executed. Result: ${JSON.stringify(result)}` }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error executing script: ${e.message}` }]
+            };
+        }
+    }
+);
+
+// --- execute_docker_script: hardened script execution restricted to Docker host endpoints ---
+
+const DOCKER_HOST_ALLOWLIST = ['localhost', '127.0.0.1', '::1', 'host.docker.internal'];
+
+function isDockerHostUrl(urlString) {
+    try {
+        const url = new URL(urlString);
+        return DOCKER_HOST_ALLOWLIST.includes(url.hostname);
+    } catch {
+        return false;
+    }
+}
+
+// Layer 2: Static analysis — block patterns that could bypass the runtime sandbox
+const BLOCKED_SCRIPT_PATTERNS = [
+    { pattern: /\beval\s*\(/,               reason: 'eval() is blocked' },
+    { pattern: /\bFunction\s*\(/,            reason: 'Function constructor is blocked' },
+    { pattern: /\bnew\s+Function\b/,         reason: 'Function constructor is blocked' },
+    { pattern: /\.contentWindow\b/,          reason: 'contentWindow access is blocked (sandbox escape)' },
+    { pattern: /\.contentDocument\b/,        reason: 'contentDocument access is blocked (sandbox escape)' },
+    { pattern: /\bimport\s*\(/,              reason: 'dynamic import() is blocked' },
+    { pattern: /\bimportScripts\s*\(/,       reason: 'importScripts is blocked' },
+    { pattern: /\bdocument\.write\s*\(/,     reason: 'document.write is blocked' },
+    { pattern: /\bdocument\.writeln\s*\(/,   reason: 'document.writeln is blocked' },
+    { pattern: /\b__proto__\b/,              reason: '__proto__ access is blocked' },
+    { pattern: /\bProxy\s*\(/,              reason: 'Proxy constructor is blocked' },
+    { pattern: /\bReflect\s*\./,             reason: 'Reflect API is blocked' },
+    { pattern: /\bObject\.definePropert/,    reason: 'Object.defineProperty is blocked (anti-tamper)' },
+    { pattern: /\bObject\.getOwnPropertyDescriptor/,  reason: 'Object.getOwnPropertyDescriptor is blocked (anti-tamper)' },
+    { pattern: /\bObject\.getPrototypeOf/,   reason: 'Object.getPrototypeOf is blocked (anti-tamper)' },
+    { pattern: /\bsetTimeout\s*\(\s*['"`]/,  reason: 'setTimeout with string argument is blocked' },
+    { pattern: /\bsetInterval\s*\(\s*['"`]/, reason: 'setInterval with string argument is blocked' },
+];
+
+// Layer 3: Runtime network sandbox — injected into the page before the user script runs.
+// Uses Object.defineProperty with configurable:false to prevent overrides from being undone.
+const DOCKER_SCRIPT_SANDBOX = `(function() {
+  if (window.__docker_script_sandbox_applied) return;
+  var A = ${JSON.stringify(DOCKER_HOST_ALLOWLIST)};
+  function ok(u) {
+    try { return A.indexOf(new URL(u, location.origin).hostname) !== -1; }
+    catch(e) { return false; }
+  }
+  function block(name) {
+    return function() { throw new Error('Blocked: ' + name + ' is not allowed in docker_script context. This API is sealed by the security sandbox.'); };
+  }
+  var dp = Object.defineProperty;
+  function seal(obj, prop, val) {
+    try { dp(obj, prop, { value: val, writable: false, configurable: false }); }
+    catch(e) { /* already sealed from a previous call — safe to skip */ }
+  }
+
+  // --- Network APIs: only allow Docker host URLs ---
+  var _fetch = window.fetch;
+  seal(window, 'fetch', function(input) {
+    var u = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
+    if (!ok(u)) throw new Error('Blocked: fetch to external URL (' + u + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
+    return _fetch.apply(this, arguments);
+  });
+
+  var _xhrOpen = XMLHttpRequest.prototype.open;
+  seal(XMLHttpRequest.prototype, 'open', function(method, url) {
+    if (!ok(String(url))) throw new Error('Blocked: XHR to external URL (' + url + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
+    return _xhrOpen.apply(this, arguments);
+  });
+
+  if (window.WebSocket) {
+    var _WS = window.WebSocket;
+    seal(window, 'WebSocket', function(url, protocols) {
+      if (!ok(String(url).replace(/^ws(s?):\\/\\//, 'http$1://'))) throw new Error('Blocked: WebSocket to external URL (' + url + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
+      return new _WS(url, protocols);
+    });
+  }
+
+  if (window.EventSource) {
+    var _ES = window.EventSource;
+    seal(window, 'EventSource', function(url, config) {
+      if (!ok(String(url))) throw new Error('Blocked: EventSource to external URL (' + url + ') not allowed. Only Docker host URLs are permitted: ' + A.join(', '));
+      return new _ES(url, config);
+    });
+  }
+
+  // --- Block fire-and-forget / exfiltration APIs ---
+  seal(navigator, 'sendBeacon', block('sendBeacon'));
+  seal(window, 'open', block('window.open'));
+
+  // --- Block Workers (separate execution context bypasses all sandbox overrides) ---
+  seal(window, 'Worker', block('Worker'));
+  seal(window, 'SharedWorker', block('SharedWorker'));
+
+  // --- Block iframe/frame/object/embed creation (fresh API references bypass sandbox) ---
+  var _createElement = document.createElement.bind(document);
+  seal(document, 'createElement', function(tag) {
+    var t = String(tag).toLowerCase();
+    if (['iframe', 'frame', 'object', 'embed'].indexOf(t) !== -1)
+      throw new Error('Blocked: creating <' + t + '> element not allowed in docker_script context. Iframe/frame/object/embed elements are blocked because they provide fresh API references that bypass the sandbox.');
+    return _createElement.apply(this, arguments);
+  });
+
+  // --- Block service worker registration ---
+  if (navigator.serviceWorker) {
+    seal(navigator.serviceWorker, 'register', block('ServiceWorker.register'));
+  }
+
+  window.__docker_script_sandbox_applied = true;
+})();
+`;
+
+server.tool(
+    "execute_docker_script",
+    "Executes JavaScript in the browser context, but ONLY when the browser is on a Docker host endpoint (localhost, 127.0.0.1, or host.docker.internal). Blocked on external URLs. This tool applies a network sandbox that prevents outbound requests to non-Docker-host URLs. Note: sandbox overrides persist on the page after execution.",
+    {
+        script: z.string().describe("JavaScript code to execute. Use 'return' to get a value back. Use 'arguments[0]', 'arguments[1]', etc. to access args. Note: eval(), Function(), Workers, iframes, and dynamic imports are blocked for security."),
+        args: z.array(z.any()).optional().describe("Optional array of arguments to pass to the script")
+    },
+    async ({ script, args = [] }) => {
+        try {
+            const driver = getDriver();
+
+            // Layer 1: Pre-execution URL check
+            const currentUrl = await driver.getCurrentUrl();
+            if (!isDockerHostUrl(currentUrl)) {
+                return {
+                    content: [{ type: 'text', text: [
+                        `[SECURITY BLOCK] execute_docker_script refused: browser is on an external URL.`,
+                        `  Current URL: ${currentUrl}`,
+                        `  Allowed hosts: ${DOCKER_HOST_ALLOWLIST.join(', ')}`,
+                        ``,
+                        `To fix: use the 'navigate' tool to go to a Docker host URL first (e.g. http://localhost:8000), then retry this script.`,
+                    ].join('\n') }]
+                };
+            }
+
+            // Layer 2: Static analysis — reject scripts with sandbox-escape patterns
+            for (const { pattern, reason } of BLOCKED_SCRIPT_PATTERNS) {
+                if (pattern.test(script)) {
+                    // Extract the matching snippet for agent feedback
+                    const match = script.match(pattern);
+                    const matchSnippet = match ? match[0] : '(unknown)';
+                    return {
+                        content: [{ type: 'text', text: [
+                            `[SECURITY BLOCK] execute_docker_script refused: script failed static analysis.`,
+                            `  Reason: ${reason}`,
+                            `  Matched pattern: "${matchSnippet}"`,
+                            ``,
+                            `To fix: rewrite your script without using ${matchSnippet}. This API is blocked because it could be used to escape the docker_script security sandbox.`,
+                            `Allowed: direct DOM access, fetch() to Docker host URLs, standard JS (no eval, no dynamic code generation, no iframes).`,
+                        ].join('\n') }]
+                    };
+                }
+            }
+
+            // Layer 3: Inject network sandbox + execute user script
+            // The sandbox IIFE runs first and seals network APIs, then the user script runs.
+            // arguments[0..N] from Selenium remain accessible to the user script.
+            const sandboxedScript = DOCKER_SCRIPT_SANDBOX + '\n' + script;
+            const result = await driver.executeScript(sandboxedScript, ...args);
+
+            // Layer 4: Post-execution URL check — detect navigation attempts
+            const postUrl = await driver.getCurrentUrl();
+            if (!isDockerHostUrl(postUrl)) {
+                try { await driver.get(currentUrl); } catch (_) { /* best effort revert */ }
+                return {
+                    content: [{ type: 'text', text: [
+                        `[SECURITY BLOCK] execute_docker_script: script navigated the browser to an external URL.`,
+                        `  Navigated to: ${postUrl}`,
+                        `  Reverted to: ${currentUrl}`,
+                        ``,
+                        `To fix: do not navigate the browser to external URLs inside docker_script. Use window.location or anchor clicks only for Docker host URLs (${DOCKER_HOST_ALLOWLIST.join(', ')}).`,
+                    ].join('\n') }]
+                };
+            }
+
+            return {
+                content: [{ type: 'text', text: `Script executed. Result: ${JSON.stringify(result)}` }]
+            };
+        } catch (e) {
+            // Distinguish sandbox security errors from regular JS errors
+            const isSandboxBlock = e.message && e.message.includes('Blocked:');
+            if (isSandboxBlock) {
+                return {
+                    content: [{ type: 'text', text: [
+                        `[SECURITY BLOCK] execute_docker_script: runtime sandbox blocked an operation.`,
+                        `  Error: ${e.message}`,
+                        ``,
+                        `The script attempted an operation that the network sandbox prevents. Outbound requests (fetch, XHR, WebSocket, EventSource) are only allowed to Docker host URLs: ${DOCKER_HOST_ALLOWLIST.join(', ')}.`,
+                        `Fully blocked APIs: sendBeacon, window.open, Worker, SharedWorker, ServiceWorker, iframe/frame/object/embed creation.`,
+                        `To fix: ensure all network requests target a Docker host URL, and avoid blocked APIs listed above.`,
+                    ].join('\n') }]
+                };
+            }
+            return {
+                content: [{ type: 'text', text: `Error executing docker script: ${e.message}` }]
+            };
+        }
+    }
+);
+
+server.tool(
+    "get_page_source",
+    "gets the current page HTML source. Useful for debugging what elements are present.",
+    {},
+    async () => {
+        try {
+            const driver = getDriver();
+            const source = await driver.getPageSource();
+            // Truncate if too long
+            const maxLength = 50000;
+            const truncated = source.length > maxLength
+                ? source.substring(0, maxLength) + `\n... [truncated, ${source.length - maxLength} more characters]`
+                : source;
+            return {
+                content: [{ type: 'text', text: truncated }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error getting page source: ${e.message}` }]
+            };
+        }
+    }
+);
+
+server.tool(
+    "wait_for_element",
+    "waits for an element to meet a condition (visible, clickable, or present in DOM)",
+    {
+        ...locatorSchema,
+        condition: z.enum(["visible", "clickable", "present"]).describe("Condition to wait for: 'visible' (displayed), 'clickable' (visible and enabled), 'present' (exists in DOM)")
+    },
+    async ({ by, value, condition, timeout = 10000 }) => {
+        try {
+            const driver = getDriver();
+            const locator = getLocator(by, value);
+            let element;
+            switch (condition) {
+                case "visible":
+                    element = await driver.wait(until.elementIsVisible(driver.findElement(locator)), timeout);
+                    break;
+                case "clickable":
+                    element = await driver.wait(until.elementLocated(locator), timeout);
+                    await driver.wait(until.elementIsVisible(element), timeout);
+                    await driver.wait(until.elementIsEnabled(element), timeout);
+                    break;
+                case "present":
+                default:
+                    element = await driver.wait(until.elementLocated(locator), timeout);
+                    break;
+            }
+            return {
+                content: [{ type: 'text', text: `Element is ${condition}: ${value}` }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Timeout waiting for element to be ${condition}: ${e.message}` }]
+            };
+        }
+    }
+);
+
+server.tool(
+    "take_screenshot",
+    "captures a screenshot of the current page and saves to a per-session subdirectory of /data/screenshots",
+    {
+        outputPath: z.string().optional().describe("Filename for the screenshot (e.g. 'screenshot.png'). Use ONLY a simple filename, NOT a full path. Files are saved under a per-session subdirectory of /data/screenshots so concurrent agents don't overwrite each other. If not provided, returns compressed image data directly."),
+        quality: z.number().min(0.1).max(1.0).optional().describe("JPEG compression quality for inline screenshots (0.1-1.0, default 0.7). Lower = smaller file size. Ignored when saving to file."),
+        maxWidth: z.number().min(100).max(3840).optional().describe("Maximum width in pixels for inline screenshots (default 1280). Image is scaled down if wider. Ignored when saving to file.")
+    },
+    async ({ outputPath, quality = 0.7, maxWidth = 1280 }) => {
+        try {
+            const driver = getDriver();
+            if (outputPath) {
+                const screenshot = await driver.takeScreenshot();
+                const fs = await import('fs');
+                const path = await import('path');
+                // Extract just the filename if a full path was provided (handles Windows paths too)
+                let filename = outputPath;
+                // Strip Windows drive letter and path separators
+                if (filename.includes(':') || filename.includes('\\') || filename.includes('/')) {
+                    filename = filename.split(/[:\\/]/).pop();
+                }
+                // Per-session subdirectory so concurrent agents sharing the /data
+                // volume don't overwrite each other's identically-named screenshots.
+                const sessionKey = getDriverKey();
+                const sessionSubdir = String(sessionKey || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
+                const screenshotDir = `/data/screenshots/${sessionSubdir}`;
+                try {
+                    await fs.promises.mkdir(screenshotDir, { recursive: true });
+                } catch (e) { /* ignore if exists */ }
+                const finalPath = `${screenshotDir}/${filename}`;
+                try {
+                    await fs.promises.writeFile(finalPath, screenshot, 'base64');
+                    // Report host path if available
+                    const hostPath = process.env.HOST_DATA_PATH
+                        ? `${process.env.HOST_DATA_PATH}/screenshots/${sessionSubdir}/${filename}`
+                        : finalPath;
+                    return {
+                        content: [{ type: 'text', text: `Screenshot saved to ${hostPath}` }]
+                    };
+                } catch (writeErr) {
+                    // Fallback: return image data directly if file save fails
+                    console.error(`Failed to save screenshot to ${finalPath}: ${writeErr.message}. Returning image data instead.`);
+                    return {
+                        content: [
+                            { type: 'text', text: `Warning: Could not save to file (${writeErr.message}). Returning image directly.` },
+                            { type: 'image', data: screenshot, mimeType: 'image/png' }
+                        ]
+                    };
+                }
+            } else {
+                // Inline screenshot: use CDP to capture JPEG directly (avoids MCP 20MB limit).
+                // CDP captures in the browser process — no large PNG transfer needed.
+                let imageData;
+                let mimeType;
+                try {
+                    const cdpTimeout = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('CDP screenshot timed out after 10s')), 10000)
+                    );
+                    const cdpResult = await Promise.race([
+                        driver.sendAndGetDevToolsCommand('Page.captureScreenshot', {
+                            format: 'jpeg',
+                            quality: Math.round(quality * 100),
+                            captureBeyondViewport: false
+                        }),
+                        cdpTimeout
+                    ]);
+                    imageData = cdpResult.data;
+                    mimeType = 'image/jpeg';
+                    debugLog(`CDP screenshot: JPEG quality=${Math.round(quality * 100)}, size=${imageData.length} chars`);
+                } catch (cdpErr) {
+                    // CDP not available (Firefox or non-Chrome) or timed out, fall back to raw PNG
+                    debugLog(`CDP screenshot failed: ${cdpErr.message}, returning raw PNG`);
+                    imageData = await driver.takeScreenshot();
+                    mimeType = 'image/png';
+                }
+                recordSuccess(getDriverKey());
+                return {
+                    content: [
+                        { type: 'image', data: imageData, mimeType }
+                    ]
+                };
+            }
+        } catch (e) {
+            recordError('take_screenshot', e);
+            return {
                 content: [{ type: 'text', text: `Error taking screenshot: ${e.message}` }]
+            };
+        }
+    }
+);
+
+// MCP Status Tool - allows agents to query status without using resources
+server.tool(
+    "get_mcp_status",
+    "Get current MCP server status including known issues, working patterns, and browser health. Call this BEFORE starting browser operations to understand current limitations.",
+    {},
+    async () => {
+        try {
+            // Read external state file
+            const externalState = readExternalState();
+
+            // Update browser health dynamically. Probed in parallel with a per-browser
+            // timeout: a single wedged Chrome used to hang this tool for every caller.
+            const browserHealth = {};
+            await Promise.all([...state.drivers].map(async ([sessionId, driver]) => {
+                let timer;
+                try {
+                    await Promise.race([
+                        driver.getTitle(),
+                        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('unresponsive (no reply within 3s)')), 3000); })
+                    ]);
+                    browserHealth[sessionId] = { status: 'healthy', lastCheck: new Date().toISOString() };
+                } catch (e) {
+                    browserHealth[sessionId] = { status: 'unhealthy', error: e.message, lastCheck: new Date().toISOString() };
+                } finally {
+                    clearTimeout(timer);
+                }
+            }));
+
+            // Merge external state with runtime state
+            const status = {
+                ...externalState,
+                buildId: BUILD_ID,
+                containerId: CONTAINER_ID,
+                restartHint: `docker restart ${CONTAINER_ID}`,
+                browserHealth,
+                recentErrors: externalState.recentErrors || state.recentErrors,
+                activeSessions: Array.from(state.drivers.keys()),
+                currentSession: state.currentSession,
+                serverUptime: process.uptime()
+            };
+
+            // Format as readable text for agents
+            let text = `## MCP Selenium Status\n\n`;
+            text += `**Build:** ${BUILD_ID}\n`;
+            text += `**Container:** ${CONTAINER_ID} — if this server wedges, restart it with \`docker restart ${CONTAINER_ID}\`\n`;
+            text += `**Server Uptime:** ${Math.round(status.serverUptime)}s\n`;
+            text += `**Active Sessions:** ${status.activeSessions.length ? status.activeSessions.join(', ') : 'None'}\n`;
+            for (const [sessionId, h] of Object.entries(browserHealth)) {
+                text += `- ${sessionId}: ${h.status}${h.error ? ` — ${h.error}; call close_session to force-kill it` : ''}\n`;
+            }
+            if (status.lastErrorUpdate) {
+                text += `**Last Error:** ${status.lastErrorUpdate}\n`;
+            }
+            text += `\n`;
+
+            text += `### Known Issues\n`;
+            const activeIssues = (status.knownIssues || []).filter(i => i.active);
+            if (activeIssues.length === 0) {
+                text += `- No known issues\n`;
+            } else {
+                for (const issue of activeIssues) {
+                    text += `- **[${issue.severity.toUpperCase()}]** ${issue.browser}: ${issue.description}\n`;
+                    text += `  - Workaround: ${issue.workaround}\n`;
+                }
+            }
+
+            text += `\n### Working Patterns\n`;
+            for (const pattern of (status.workingPatterns || [])) {
+                text += `- **${pattern.pattern}**: ${pattern.description}\n`;
+                text += `  - Recommended: \`${pattern.recommended}\`\n`;
+                text += `  - Avoid: ${pattern.avoid.map(a => `\`${a}\``).join(', ')}\n`;
+            }
+
+            if (status.notes && status.notes.length > 0) {
+                text += `\n### Notes\n`;
+                for (const note of status.notes) {
+                    text += `- ${note}\n`;
+                }
+            }
+
+            if (status.agentFeedback && status.agentFeedback.length > 0) {
+                text += `\n### Agent Feedback (last ${Math.min(5, status.agentFeedback.length)})\n`;
+                for (const fb of status.agentFeedback.slice(0, 5)) {
+                    text += `- [${fb.type.toUpperCase()}${fb.browser && fb.browser !== 'all' ? `/${fb.browser}` : ''}] ${fb.message}\n`;
+                }
+                text += `  _(full history: /data/agent-feedback.jsonl)_\n`;
+            }
+
+            if (status.recentErrors && status.recentErrors.length > 0) {
+                text += `\n### Recent Errors\n`;
+                for (const err of status.recentErrors.slice(0, 5)) {
+                    text += `- [${err.timestamp}] ${err.context}: ${err.message}\n`;
+                }
+            }
+
+            return {
+                content: [{ type: 'text', text }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error getting MCP status: ${e.message}` }]
             };
         }
     }
@@ -428,13 +1696,28 @@ server.tool(
     {},
     async () => {
         try {
-            const driver = getDriver();
-            await driver.quit();
-            state.drivers.delete(state.currentSession);
-            const sessionId = state.currentSession;
-            state.currentSession = null;
+            const key = getDriverKey();
+            if (!key || !state.drivers.has(key)) {
+                return { content: [{ type: 'text', text: 'No active browser session to close' }] };
+            }
+            // Succeeds even when Chrome is wedged: state is released immediately and a
+            // quit that hangs past DRIVER_QUIT_TIMEOUT_MS is replaced by a targeted kill.
+            const outcome = await forceQuitDriver(key, 'close_session');
+            // Only clear currentSession in STDIO mode
+            if (!getMcpSessionId()) {
+                state.currentSession = null;
+                // Kill orphaned Chrome processes to prevent memory accumulation
+                try {
+                    const { execSync } = await import('child_process');
+                    execSync('pkill -9 chromium || true', { stdio: 'ignore' });
+                    execSync('pkill -9 chrome || true', { stdio: 'ignore' });
+                    execSync('rm -rf /tmp/chrome-* /tmp/.org.chromium.* || true', { stdio: 'ignore' });
+                } catch (e) { /* ignore */ }
+            }
+            debugLog(`Browser session closed: key=${key}, outcome=${outcome}, remaining=${state.drivers.size}`);
+            const how = outcome === 'killed' ? ' (browser was unresponsive — force-killed)' : '';
             return {
-                content: [{ type: 'text', text: `Browser session ${sessionId} closed` }]
+                content: [{ type: 'text', text: `Browser session ${key} closed${how}. Remaining active: ${state.drivers.size}` }]
             };
         } catch (e) {
             return {
@@ -444,30 +1727,105 @@ server.tool(
     }
 );
 
-// Resources
-server.resource(
-    "browser-status",
-    new ResourceTemplate("browser-status://current"),
-    async (uri) => ({
-        contents: [{
-            uri: uri.href,
-            text: state.currentSession
-                ? `Active browser session: ${state.currentSession}`
-                : "No active browser session"
-        }]
-    })
+server.tool(
+    "log_feedback",
+    "Log agent observations, bugs, or working patterns so other agents can learn from them via get_mcp_status. Use this to share discoveries about what works or doesn't work with Selenium MCP.",
+    {
+        type: z.enum(['issue', 'pattern', 'note', 'resolve']).describe(
+            "Type: 'issue' = bug/problem encountered, 'pattern' = working approach discovered, 'note' = general observation, 'resolve' = mark an existing issue as fixed"
+        ),
+        message: z.string().describe(
+            "The feedback. For 'issue': describe the problem and workaround if known. For 'pattern': describe the working approach. For 'note': general observation. For 'resolve': describe what fixed it."
+        ),
+        severity: z.enum(['low', 'medium', 'high', 'blocker']).optional().describe(
+            "Severity for 'issue' type only. Default: medium"
+        ),
+        issueId: z.string().optional().describe(
+            "For 'resolve' type: the ID of the issue to deactivate (see get_mcp_status for IDs)"
+        ),
+        browser: z.string().optional().describe(
+            "Browser this applies to: chrome, firefox, edge, or 'all'. Default: all"
+        )
+    },
+    async ({ type, message, severity = 'medium', issueId, browser = 'all' }) => {
+        try {
+            const timestamp = new Date().toISOString();
+            const entry = { timestamp, type, message, browser, severity: type === 'issue' ? severity : undefined };
+
+            // Append to raw JSONL log (full history, never trimmed)
+            try {
+                fs.mkdirSync('/data', { recursive: true });
+                fs.appendFileSync(FEEDBACK_LOG_FILE, JSON.stringify(entry) + '\n');
+            } catch (e) {
+                debugLog(`Failed to append to feedback log: ${e.message}`);
+            }
+
+            // Update structured state
+            const externalState = readExternalState();
+            externalState.agentFeedback = externalState.agentFeedback || [];
+            externalState.agentFeedback.unshift(entry);
+            if (externalState.agentFeedback.length > 50) {
+                externalState.agentFeedback.pop();
+            }
+
+            if (type === 'issue') {
+                const id = `agent-${Date.now()}`;
+                externalState.knownIssues = externalState.knownIssues || [];
+                externalState.knownIssues.unshift({
+                    id,
+                    browser,
+                    severity,
+                    description: message,
+                    workaround: 'See agent-feedback.jsonl for context',
+                    active: true,
+                    reportedAt: timestamp
+                });
+            } else if (type === 'resolve' && issueId) {
+                const issue = (externalState.knownIssues || []).find(i => i.id === issueId);
+                if (issue) {
+                    issue.active = false;
+                    issue.resolvedAt = timestamp;
+                    issue.resolution = message;
+                }
+            } else if (type === 'pattern') {
+                externalState.workingPatterns = externalState.workingPatterns || [];
+                externalState.workingPatterns.unshift({
+                    pattern: `agent-${Date.now()}`,
+                    description: message,
+                    recommended: browser !== 'all' ? `(${browser} only)` : '(all browsers)',
+                    avoid: [],
+                    reportedAt: timestamp
+                });
+            } else if (type === 'note') {
+                externalState.notes = externalState.notes || [];
+                externalState.notes.unshift(`[${timestamp}] ${message}`);
+                if (externalState.notes.length > 20) externalState.notes.pop();
+            }
+
+            writeExternalState(externalState);
+            return {
+                content: [{ type: 'text', text: `Feedback logged (${type}): "${message.slice(0, 80)}${message.length > 80 ? '…' : ''}"` }]
+            };
+        } catch (e) {
+            return {
+                content: [{ type: 'text', text: `Error logging feedback: ${e.message}` }]
+            };
+        }
+    }
 );
+
+    return server;
+}
+
+// Resources removed — ResourceTemplate registration causes resources/list to throw
+// "Cannot read properties of undefined (reading 'list')" in MCP SDK 1.20.x.
+// Use the get_mcp_status tool instead, which exposes the same information.
+void ResourceTemplate; // keep import reference live to avoid lint warnings
 
 // Cleanup handler
 async function cleanup() {
-    for (const [sessionId, driver] of state.drivers) {
-        try {
-            await driver.quit();
-        } catch (e) {
-            console.error(`Error closing browser session ${sessionId}:`, e);
-        }
-    }
-    state.drivers.clear();
+    // Parallel + time-bounded so a wedged browser can't stall container shutdown.
+    await Promise.all([...state.drivers.keys()].map((k) => forceQuitDriver(k, 'shutdown')));
     state.currentSession = null;
     process.exit(0);
 }
@@ -475,6 +1833,267 @@ async function cleanup() {
 process.on('SIGTERM', cleanup);
 process.on('SIGINT', cleanup);
 
-// Start the server
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// Parse command line arguments
+const args = process.argv.slice(2);
+const transportMode = args.includes('--http') ? 'http' :
+                      args.includes('--sse') ? 'sse' :
+                      process.env.MCP_TRANSPORT || 'stdio';
+const port = parseInt(process.env.MCP_PORT || '3000', 10);
+
+// Start the server based on transport mode
+if (transportMode === 'stdio') {
+    // Standard stdio transport (default) — one process, one session, so a single
+    // McpServer instance for the process lifetime is correct here.
+    console.error(`Selenium MCP starting: build=${BUILD_ID} transport=${transportMode}`);
+    const stdioServer = createMcpServer();
+    const transport = new StdioServerTransport();
+    await stdioServer.connect(transport);
+} else if (transportMode === 'http') {
+    console.log(`Selenium MCP starting: build=${BUILD_ID} transport=${transportMode}`);
+    // Streamable HTTP transport (recommended for remote MCP servers)
+    const app = express();
+    app.use(cors());
+
+    // Store one { server, transport, createdAt, lastSeenAt } entry per MCP session.
+    // Each session gets its OWN McpServer instance — the SDK's Protocol.connect()
+    // (node_modules/@modelcontextprotocol/sdk/dist/esm/shared/protocol.js) overwrites
+    // a single shared this._transport, so sharing one McpServer across sessions
+    // caused cross-session response contamination and hangs. One server per session
+    // avoids that entirely.
+    const sessions = new Map();
+
+    // Single MCP endpoint for all operations (Streamable HTTP)
+    // NOTE: Do NOT use express.json() middleware before this route -
+    // StreamableHTTPServerTransport needs to read the raw request stream
+    app.all('/mcp', async (req, res) => {
+        debugLog(`MCP request received: method=${req.method}`);
+        const presentedId = req.headers['mcp-session-id'];
+        const sessionId = presentedId || randomUUID();
+        debugLog(`Session ID: ${sessionId}`);
+
+        let session = sessions.get(sessionId);
+
+        // A DELETE for a session we no longer hold is already done — don't resurrect it.
+        if (!session && presentedId && req.method === 'DELETE') {
+            return res.status(200).end();
+        }
+
+        if (!session) {
+            // A client presenting an id we don't hold initialized it earlier, before a
+            // reap or a container restart. It won't re-send initialize.
+            const resurrect = !!presentedId;
+            // Create a brand-new McpServer + transport dedicated to this session.
+            const sessionServer = createMcpServer();
+            const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => sessionId,
+            });
+
+            // Loud failure paths. These MUST be assigned before sessionServer.connect()
+            // below: Protocol.connect() captures whatever onerror/onclose already sit on
+            // the transport and wraps them (calls ours, then its own internal handler),
+            // so setting them after connect() would silently replace — not augment —
+            // the SDK's own cleanup logic.
+            transport.onerror = (err) => {
+                metrics.transportErrors++;
+                console.error(`[TRANSPORT-ERROR] session=${sessionId}: ${err.message}`);
+            };
+            transport.onclose = () => {
+                // If this transport was reaped and the client has since been resurrected
+                // under the same id, the slot belongs to the new session — touching it
+                // would delete the new session and kill its new browser.
+                if (sessions.get(sessionId)?.transport !== transport) return;
+                console.error(`[SESSION-CLOSED] session=${sessionId}`);
+                sessions.delete(sessionId);
+                forceQuitDriver(sessionId, 'session-closed')
+                    .catch((e) => console.error(`Error releasing browser for closed session ${sessionId}: ${e.message}`));
+            };
+
+            // Protocol-level errors (distinct from the transport-level errors above —
+            // e.g. failure to send a response, or an unknown message type).
+            sessionServer.server.onerror = (err) => {
+                metrics.protocolErrors++;
+                console.error(`[PROTOCOL-ERROR] session=${sessionId}: ${err.message}`);
+            };
+
+            session = { server: sessionServer, transport, createdAt: Date.now(), lastSeenAt: Date.now() };
+            sessions.set(sessionId, session);
+
+            // Explicitly echo session ID in response header so a load balancer
+            // (e.g. HAProxy stick-table) can establish session affinity on first request
+            res.setHeader('Mcp-Session-Id', sessionId);
+
+            // Connect this session's own MCP server to its own transport
+            await sessionServer.connect(transport);
+
+            if (resurrect) {
+                // Without this the SDK transport answers every call with 400 "Server not
+                // initialized" until the user manually reconnects — what broke Claude Code
+                // sessions after every selenium-headed restart. Mark the fresh transport
+                // initialized under the client's existing id so the call is simply served.
+                // The old browser is gone; browser tools report "No active browser session".
+                // NOTE: sets StreamableHTTPServerTransport internals (@modelcontextprotocol/sdk
+                // 1.20.0 — validateSession checks _initialized and sessionId). Re-verify on SDK upgrade.
+                transport._initialized = true;
+                transport.sessionId = sessionId;
+                metrics.resurrectedSessions++;
+                console.log(`[SESSION-RESURRECTED] ${sessionId} (build=${BUILD_ID})`);
+            } else {
+                console.log(`New MCP session: ${sessionId} (build=${BUILD_ID})`);
+            }
+        } else {
+            session.lastSeenAt = Date.now();
+        }
+
+        const { transport } = session;
+
+        // Misroute guard: under the old shared-server design, one session's transport
+        // could silently receive another session's responses. Each session now owns
+        // its own McpServer so this should never trip — kept as a loud regression
+        // guard rather than a silent hang.
+        if (transport.sessionId !== undefined && transport.sessionId !== sessionId) {
+            metrics.misrouteGuardTrips++;
+            console.error(`[MISROUTE-GUARD] map key=${sessionId} but transport.sessionId=${transport.sessionId}`);
+            return res.status(500).json({ error: 'Session misroute detected', expectedSessionId: sessionId, transportSessionId: transport.sessionId });
+        }
+
+        // Track in-flight tool calls (POSTs) so the reaper never evicts a busy session.
+        // handleRequest() returns as soon as the SSE response stream is opened — the tool
+        // call itself runs after that — so completion is the response closing (final
+        // result sent, or the client gone), not the await below. GETs are long-lived SSE
+        // listening streams, not work, so they don't count as busy.
+        if (req.method === 'POST') {
+            const s = session;
+            if (!s.inflight) s.busySince = Date.now();
+            s.inflight = (s.inflight || 0) + 1;
+            res.once('close', () => {
+                s.inflight -= 1;
+                if (s.inflight <= 0) { s.inflight = 0; s.busySince = null; }
+            });
+        }
+
+        // Handle the request within session context so tool handlers
+        // can identify which MCP session is calling them
+        try {
+            await mcpSessionContext.run({ mcpSessionId: sessionId }, async () => {
+                await transport.handleRequest(req, res);
+            });
+        } catch (err) {
+            console.error('MCP request error:', err);
+            if (!res.headersSent) {
+                res.status(500).json({ error: err.message });
+            }
+        }
+    });
+
+    // JSON parsing for non-MCP routes
+    app.use(express.json());
+
+    // Background Chrome health checker — ONLY runs on idle sessions (no successful
+    // tool call in the last 15s). This avoids false positives from executeScript
+    // queuing behind an active navigate and timing out while Chrome is healthy.
+    // Primary crash detection is reactive (via recordError pattern matching).
+    // This background check catches the case where Chrome dies between tool calls.
+    async function runIdleDriverHealthChecks() {
+        const now = Date.now();
+        for (const [key, driver] of state.drivers) {
+            const lastSuccess = lastToolSuccessAt.get(key) || 0;
+            if (now - lastSuccess < 15000) continue; // skip — session is active
+            try {
+                await Promise.race([
+                    driver.executeScript('return 1'),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+                ]);
+                // Successful idle check — clear any prior unhealthy state
+                const h = state.driverHealth.get(key);
+                if (h && !h.healthy) {
+                    state.driverHealth.set(key, { healthy: true, failCount: 0, checkedAt: now });
+                    console.log(`Driver health recovered for ${key}`);
+                }
+                lastToolSuccessAt.set(key, now);
+            } catch (e) {
+                const prev = state.driverHealth.get(key) || { failCount: 0 };
+                const failCount = prev.failCount + 1;
+                state.driverHealth.set(key, { healthy: false, failCount, checkedAt: now, error: e.message });
+                console.error(`Idle health check failed for ${key} (fail #${failCount}): ${e.message}`);
+                // After 2 consecutive failures the session is unrecoverable — clean it up so
+                // /health can return 200 again and the container re-enters HAProxy rotation.
+                if (failCount >= 2) {
+                    console.error(`Auto-cleanup: removing unrecoverable session ${key}`);
+                    await forceQuitDriver(key, 'health-autocleanup');
+                }
+            }
+        }
+        // Remove stale health entries for drivers that no longer exist
+        for (const key of state.driverHealth.keys()) {
+            if (!state.drivers.has(key)) state.driverHealth.delete(key);
+        }
+    }
+    setInterval(runIdleDriverHealthChecks, 15000);
+
+    // Session reaper / watchdog. HTTP MCP clients (Claude Code included) rarely send a
+    // DELETE when they go away, so without this every session ever opened stays in
+    // `sessions` for the life of the container — selenium-headed had accumulated 1,240
+    // when it wedged on 2026-10-19. Idle sessions are evicted (browser sessions get a
+    // longer grace period); a session whose tool call has run past HUNG_REQUEST_MS is
+    // treated as wedged and recycled — its browser is force-killed, which also unblocks
+    // the stuck call. Eviction is invisible to a client that returns later: its next
+    // request is resurrected on a fresh session (see the /mcp route).
+    const SESSION_IDLE_MS = parseInt(process.env.SESSION_IDLE_MS || String(10 * 60 * 1000), 10);
+    const BROWSER_IDLE_MS = parseInt(process.env.BROWSER_IDLE_MS || String(60 * 60 * 1000), 10);
+    const HUNG_REQUEST_MS = parseInt(process.env.HUNG_REQUEST_MS || String(15 * 60 * 1000), 10);
+    function reapSessions() {
+        const now = Date.now();
+        for (const [id, s] of sessions) {
+            const hasBrowser = state.drivers.has(id);
+            let reason = null;
+            if (s.inflight > 0) {
+                if (s.busySince && now - s.busySince >= HUNG_REQUEST_MS) reason = 'hung-request';
+            } else if (now - s.lastSeenAt >= (hasBrowser ? BROWSER_IDLE_MS : SESSION_IDLE_MS)) {
+                reason = 'idle';
+            }
+            if (!reason) continue;
+            sessions.delete(id);
+            metrics.reapedSessions++;
+            console.error(`[SESSION-REAPED] session=${id} reason=${reason} idleSec=${Math.round((now - s.lastSeenAt) / 1000)} browser=${hasBrowser}`);
+            forceQuitDriver(id, `reaper-${reason}`).catch(() => {});
+            Promise.resolve().then(() => s.transport.close()).catch(() => {});
+        }
+    }
+    setInterval(reapSessions, parseInt(process.env.REAP_INTERVAL_MS || '60000', 10));
+
+    // Health check endpoint — returns 503 if any active Chrome session has crashed
+    // (2+ consecutive health check failures). HAProxy marks this backend DOWN on 503,
+    // pulling it out of rotation until Chrome recovers or the session is closed.
+    app.get('/health', (req, res) => {
+        const sessionCount = sessions.size;
+        const browserCount = state.drivers.size;
+        const crashed = [];
+        for (const [key, h] of state.driverHealth) {
+            if (!h.healthy && h.failCount >= 2 && state.drivers.has(key)) {
+                crashed.push({ session: key, failCount: h.failCount, error: h.error });
+            }
+        }
+        const base = {
+            status: crashed.length > 0 ? 'degraded' : 'ok',
+            transport: 'streamable-http',
+            buildId: BUILD_ID,
+            containerId: CONTAINER_ID,
+            sessions: sessionCount,
+            browsers: browserCount,
+            metrics: { ...metrics }
+        };
+        if (crashed.length > 0) {
+            return res.status(503).json({ ...base, crashed });
+        }
+        res.json(base);
+    });
+
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`Selenium MCP server running on http://0.0.0.0:${port} (streamable-http transport)`);
+        console.log(`  MCP endpoint: http://0.0.0.0:${port}/mcp`);
+        console.log(`  Health check: http://0.0.0.0:${port}/health`);
+    });
+} else {
+    console.error(`Unknown transport mode: ${transportMode}`);
+    process.exit(1);
+}

@@ -1,0 +1,100 @@
+---
+# Selenium MCP Fleet — run with:
+#   docker compose -f docker-compose.fleet.yml up -d
+#
+# selenium-1 and selenium-2 are permanent baseline workers (always running).
+# selenium-3 through selenium-14 are created/removed dynamically by the autoscaler
+# as agent demand increases and decreases.
+#
+# HAProxy declares only the permanent workers. The autoscaler registers dynamic workers
+# through HAProxy's runtime API (stats socket :9999 on the compose network), by container
+# IP — never by polling Docker DNS for names that may not exist (that flooded dockerd's log
+# and deadlocked the Docker engine on 2026-10-22).
+#
+# Claude Code config (in ~/.claude.json mcpServers):
+#   "selenium": { "type": "http", "url": "http://localhost:3100/mcp" }
+
+name: selenium-mcp
+
+services:
+
+  haproxy:
+    image: haproxy:2.8-alpine
+    ports:
+      - "3100:80"      # MCP endpoint → http://localhost:3100/mcp
+      - "3101:8404"    # HAProxy stats (optional)
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      selenium-1:
+        condition: service_healthy
+      selenium-2:
+        condition: service_healthy
+    restart: unless-stopped
+
+  autoscaler:
+    build:
+      context: ./autoscaler
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      selenium-1:
+        condition: service_healthy
+    environment:
+      COMPOSE_PROJECT: selenium-mcp
+      DOCKER_NETWORK: selenium-mcp_default
+      DOCKER_VOLUME: selenium-mcp_selenium-data
+      WORKER_IMAGE: selenium-mcp
+      HAPROXY_ADMIN: "haproxy:9999"  # HAProxy runtime API (dynamic worker registration)
+      MIN_WORKERS: "2"
+      MAX_WORKERS: "14"
+      WORKER_MEMORY: "2g"            # memory cap for dynamic workers (2g handles heavy sites like Airbnb)
+      SCALE_DOWN_IDLE_MS: "120000"   # 2 min idle before removing a dynamic worker
+      POLL_INTERVAL_MS: "30000"      # check every 30s
+    restart: unless-stopped
+
+  selenium-1:
+    image: selenium-mcp
+    environment:
+      MCP_TRANSPORT: http
+      MCP_PORT: "3000"
+      LOCALHOST_FORWARD_PORTS: ""
+    volumes:
+      - selenium-data:/data
+    mem_limit: 2g
+    memswap_limit: 2g
+    shm_size: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  selenium-2:
+    image: selenium-mcp
+    environment:
+      MCP_TRANSPORT: http
+      MCP_PORT: "3000"
+      LOCALHOST_FORWARD_PORTS: ""
+    volumes:
+      - selenium-data:/data
+    mem_limit: 2g
+    memswap_limit: 2g
+    shm_size: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  selenium-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: C:/Users/Noah/Scratch/selenium-mcp

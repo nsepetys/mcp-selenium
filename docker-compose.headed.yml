@@ -1,0 +1,60 @@
+---
+# selenium-headed — headed, GPU-accelerated, host-mimicking Chrome MCP server.
+#
+# Bring it up (or back) with:
+#   docker compose -f docker-compose.headed.yml up -d
+#
+# Own compose project ("selenium-headed") so commands here never touch the fleet's
+# "selenium-mcp" project. Declared here instead of a one-off `docker run` because the
+# container was silently deleted once (2026-10-02) and a restart policy can't undo a
+# deletion — this file makes recovery one command and keeps the config versioned.
+#
+# Claude Code config (~/.claude.json mcpServers):
+#   "selenium-headed": { "type": "http", "url": "http://localhost:3200/mcp" }
+# Watch the live browser: http://localhost:7950 (noVNC)
+#
+# Image: built from Dockerfile.chrome-headed, which layers on the local
+# selenium-mcp:chrome-dzn image (Mesa d3d12 GPU driver compiled from source — that
+# base build takes ~25 min; it is not on any registry, so don't prune it).
+
+name: selenium-headed
+
+services:
+  selenium-headed:
+    image: selenium-mcp:chrome-headed
+    build:
+      context: .
+      dockerfile: Dockerfile.chrome-headed
+    container_name: selenium-headed
+    restart: unless-stopped
+    shm_size: 1g
+    environment:
+      # GPU passthrough on Docker Desktop/WSL2: the D3D12 runtime comes from the
+      # host's /usr/lib/wsl (mounted below). The d3d12/NVIDIA-adapter selection env
+      # and Chrome's --use-angle=gl default are baked into the image.
+      NVIDIA_DRIVER_CAPABILITIES: all
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      LOCALHOST_FORWARD_PORTS: ""
+      # Session reaper / watchdog (see src/lib/server.js reapSessions)
+      SESSION_IDLE_MS: "600000"     # evict browser-less sessions idle 10 min
+      BROWSER_IDLE_MS: "3600000"    # evict sessions with a browser idle 60 min
+      HUNG_REQUEST_MS: "900000"     # recycle a session whose tool call runs > 15 min
+      DRIVER_QUIT_TIMEOUT_MS: "10000"
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+    ports:
+      - "3200:3000"   # MCP endpoint
+      - "7950:7900"   # noVNC (7900 on the host is taken by the Swaffham grid)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--max-time", "5", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
