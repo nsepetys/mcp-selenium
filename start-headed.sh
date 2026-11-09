@@ -14,9 +14,12 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # 1920x1080-DIP window fits the screen (at 1920x1080 it overflowed to 3840x2160 px).
 # A restart (restart: unless-stopped) reuses the container filesystem, and a leftover
 # lock makes Xvfb refuse to start ("Server is already active for display 99").
+# Depth 24, not 30: x11vnc mistranslates a 30-bit framebuffer into the 24-bit format
+# noVNC asks for, so the viewer showed noise-like false colors (Chrome itself rendered
+# fine). 30 bought nothing: Chrome reports screen.colorDepth 24 either way.
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
-echo "[start-headed] launching Xvfb :99 (3840x2160x30)..."
-Xvfb :99 -screen 0 3840x2160x30 -ac +extension GLX +render &
+echo "[start-headed] launching Xvfb :99 (3840x2160x24)..."
+Xvfb :99 -screen 0 3840x2160x24 -ac +extension GLX +render &
 export DISPLAY=:99
 
 echo "[start-headed] waiting for display :99..."
